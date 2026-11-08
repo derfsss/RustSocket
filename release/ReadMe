@@ -103,3 +103,10 @@ Please report:
 ----------
 rustsocket.library is under the MIT licence. It includes smoltcp
 (https://github.com/smoltcp-rs/smoltcp), under the 0BSD licence.
+
+Thanks to Olaf Barthel for Roadshow, whose documentation and behaviour
+rustsocket follows, and to Darren Reed for IP Filter, whose 3.4.21 design
+its filter reimplements. Source: https://github.com/derfsss/RustSocket
+
+
+Richard Gibbs -- rich_gibbs@hotmail.com

@@ -113,7 +113,33 @@ Roadshow's file back returns to Roadshow.
   `cargo test --lib --features socket-tcp-reno` in
   `third_party/smoltcp-0.14.0`.
 
+## Credits
+
+- [smoltcp-rs/smoltcp](https://github.com/smoltcp-rs/smoltcp): the TCP/IP
+  library the stack is built on, vendored in `third_party/` with small
+  patches (0BSD).
+- [derfsss/rust-amigaos4-crate](https://github.com/derfsss/rust-amigaos4-crate):
+  the `amigaos4` crate (AmigaOS 4 bindings for Rust), the `amigaos4/`
+  submodule.
+- [AmigaLabs/rust](https://github.com/AmigaLabs/rust) (branch `amigaos-port`):
+  the Rust fork with the `powerpc-unknown-amigaos` target.
+- [walkero-gr/amigagccondocker](https://github.com/walkero-gr/amigagccondocker):
+  the cross-compiler Docker image (gcc and the AmigaOS SDK) the library is
+  linked in.
+- [derfsss/VirtioRust](https://github.com/derfsss/VirtioRust): where
+  netprof and netprof-host come from, and the QEMU test machines.
+- Roadshow, by Olaf Barthel: the bsdsocket.library this one is compatible
+  with; its documentation and behaviour are the reference
+  (`docs/roadshow-compat.md`).
+- IP Filter 3.4.21, by Darren Reed: the rule engine, state, NAT, logging
+  and auth that `rsnet-core/src/ipfil.rs` and `ipnat.rs` reimplement in Rust
+  from its public source, so that Roadshow's ipf tools work unchanged.
+
 ## Licence
 
 MIT (LICENSE). smoltcp is under the 0BSD licence
 (`third_party/smoltcp-0.14.0/LICENSE-0BSD.txt`).
+
+---
+
+Richard Gibbs — rich_gibbs@hotmail.com
