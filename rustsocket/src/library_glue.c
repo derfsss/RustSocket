@@ -33,9 +33,9 @@
 #define LIBNAME    "rustsocket.library"
 #endif
 #define LIBVER     4   /* Roadshow's bsdsocket.library interface, version 4 */
-#define LIBREV     1
+#define LIBREV     2
 #define LIBPRI     0
-#define VSTRING    LIBNAME " 4.1 (6.11.2026) rustsocket"
+#define VSTRING    LIBNAME " 4.2 (8.11.2026) rustsocket"
 
 /* Read by the amigaos4 crate. */
 struct ExecIFace *IExec = NULL;

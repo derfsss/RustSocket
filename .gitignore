@@ -22,3 +22,6 @@ testprogs/rstcp/c/*
 CLAUDE.md
 notes/
 /local/
+
+# Release archives (tools/make-release.sh)
+dist/
