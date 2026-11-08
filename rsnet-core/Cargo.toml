@@ -1,0 +1,44 @@
+[package]
+name = "rsnet-core"
+version = "0.1.0"
+edition = "2021"
+description = "The core of rustsocket.library: a SANA-II link, smoltcp on it, and the stack process"
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+amigaos4 = { path = "../amigaos4", default-features = false, features = ["dos", "device", "sana2", "timer"] }
+smoltcp = { version = "0.14.0", default-features = false, features = [
+    "alloc",
+    "medium-ethernet",
+    "proto-ipv4",
+    "proto-dhcpv4",
+    "socket-dhcpv4",
+    "socket-icmp",
+    "socket-udp",
+    "socket-tcp",
+    # Congestion control: without it smoltcp sends its whole send window
+    # at once; with tcp.sendspace 256 KB on an AmigaOne X5000 that put
+    # 109 MB on the wire for 67 MB delivered at 0.18 MB/s.
+    "socket-tcp-reno",
+    "socket-dns",
+    "socket-raw",
+    "auto-icmp-echo-reply",
+    # Roadshow's routes and alias addresses (smoltcp 0.14 defaults: 2 each).
+    "iface-max-route-count-64",
+    "iface-max-addr-count-8",
+    # Datagrams larger than the MTU, out (up to udp.sendspace, 9216 by
+    # default) and in (large DNS answers): Roadshow fragments and
+    # reassembles. The buffers live in each Interface (48 KB); the stack
+    # process's stack is sized for them.
+    "proto-ipv4-fragmentation",
+    "fragmentation-buffer-size-16384",
+    "reassembly-buffer-size-16384",
+    "reassembly-buffer-count-2",
+] }
+
+[features]
+# Phase timings on the debug log every 10 s (src/perf.rs).
+perf = ["smoltcp/rsnet-perf"]

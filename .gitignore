@@ -1,0 +1,24 @@
+# Cargo and make output
+target/
+build/
+*.debug
+*.a
+*.o
+
+# Built AmigaOS binaries
+rustsocket/rustsocket.library
+rustsocket/dropin/
+testprogs/rstcp/rstcp
+testprogs/rsprobe/rsprobe
+testprogs/rsnet/rsnet
+testprogs/netprof/netprof
+testprogs/rstcp/c/*
+!testprogs/rstcp/c/*.c
+
+# Release archives
+*.lha
+
+# Local working notes (not published)
+CLAUDE.md
+notes/
+/local/

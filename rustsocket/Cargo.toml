@@ -1,0 +1,31 @@
+[package]
+name = "rustsocket"
+version = "0.1.0"
+edition = "2021"
+autobins = false
+
+[lib]
+name = "rustsocket"
+crate-type = ["staticlib"]
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+
+[dependencies]
+amigaos4 = { path = "../amigaos4", default-features = false, features = ["dos", "device", "sana2", "timer"] }
+rsnet-core = { path = "../rsnet-core" }
+
+# The vendored smoltcp 0.14.0 with the patches rustsocket needs
+# (third_party/smoltcp-0.14.0, marked "rustsocket patch" or "VirtioRust").
+[patch.crates-io]
+smoltcp = { path = "../third_party/smoltcp-0.14.0" }
+
+[features]
+# rsnet-core's phase timings (src/perf.rs there).
+perf = ["rsnet-core/perf"]

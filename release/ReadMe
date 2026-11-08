@@ -1,0 +1,105 @@
+rustsocket.library beta
+=======================
+
+rustsocket.library is a TCP/IP stack for AmigaOS 4.1 Final Edition that
+replaces Roadshow's bsdsocket.library. It is written in Rust on the smoltcp
+TCP/IP library and works with any SANA-II network driver.
+
+Nothing else changes when you install it: Roadshow's start-up script,
+AddNetInterface, the Network prefs, your interface files, RoadshowControl,
+ping, tcpdump, the superserver and your network programs (PPC and 68k)
+keep working as before, now on rustsocket. Putting Roadshow's file back
+returns everything to Roadshow.
+
+Tested so far: an AmigaOne X5000 (p50x0_eth.device, gigabit Ethernet) and
+QEMU's AmigaOne machine (virtionet.device). This is a beta: please report
+what works and what does not, on any machine.
+
+
+1. What you need
+----------------
+- AmigaOS 4.1 Final Edition with Roadshow installed (it is part of the
+  system). rustsocket uses Roadshow's tools and configuration files.
+- A working network set-up under Roadshow. Set the network up and test it
+  with Roadshow first.
+
+
+2. Install
+----------
+In a Shell, in this drawer:
+
+    Copy LIBS:bsdsocket.library LIBS:bsdsocket.library.roadshow
+    Copy bsdsocket.library LIBS:
+    Protect LIBS:bsdsocket.library +rwed
+
+Reboot. To check that rustsocket is running:
+
+    Version bsdsocket.library FULL
+
+shows "rustsocket" on its second line.
+
+
+3. Uninstall
+------------
+    Copy LIBS:bsdsocket.library.roadshow LIBS:bsdsocket.library
+
+and reboot. A stack cannot be swapped while it runs, so changing in
+either direction always needs a reboot.
+
+
+4. Settings
+-----------
+rustsocket reads Roadshow's settings (RoadshowControl, ENV:Roadshow/...).
+Where it differs:
+
+- tcp.sendspace (the send buffer of a new TCP connection) is 64 KB, not
+  Roadshow's 32 KB. On gigabit Ethernet this sends at the line rate.
+- TCP receive buffers grow and shrink with each connection's speed, up
+  to tcp.recvspace.max (default 1 MB; 512 KB on a local network). This is
+  rustsocket's own option.
+- tcp.sendspace.max is the same for send buffers. Its default, 64 KB,
+  means no growth. You can raise it with
+      RoadshowControl SET tcp.sendspace.max=1048576
+  but this has not been shown to make uploads faster.
+
+The other options, and the few that rustsocket cannot change (for example
+udp.cksum, which is always on), are listed in the compatibility notes.
+
+
+5. Known differences from Roadshow
+----------------------------------
+- RemoveNetInterface removes any interface that no connection uses.
+  Roadshow refuses ("Device busy") once an interface has been configured.
+- syslog messages go to the debug output (NetLogViewer shows them), not
+  to a log file.
+- Not done yet: point-to-point interfaces, BOOTP and link-local address
+  allocation, multicast, the IP Filter FTP proxy's address rewriting.
+- IP headers leave with ID 0 and the Don't Fragment flag set. This is
+  allowed and programs do not see it, but tcpdump shows it.
+
+The full list, call by call and tool by tool, is in roadshow-compat.md in
+the source repository.
+
+
+6. If something goes wrong
+--------------------------
+rustsocket writes what it does to the debug output, in lines that start
+with "rustsocket.library" or "rsnet". After a problem, before rebooting:
+
+    DumpDebugBuffer >RAM:debug.txt
+
+If the network is gone and you cannot get at the machine, uninstall from
+another boot (for example, boot without the startup-sequence and copy
+LIBS:bsdsocket.library.roadshow back).
+
+Please report:
+  - the machine and the network driver (and its version),
+  - what you did and what happened,
+  - RAM:debug.txt, or the lines from it that start with
+    "rustsocket.library" or "rsnet".
+
+
+7. Licence
+----------
+rustsocket.library is under the MIT licence. It includes smoltcp
+(https://github.com/smoltcp-rs/smoltcp), under the 0BSD licence.
