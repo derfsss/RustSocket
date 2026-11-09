@@ -48,6 +48,8 @@ const ARP_READS: usize = 4;
 pub const READS: u32 = (IPV4_READS + ARP_READS) as u32;
 /// Frames received but not yet taken by smoltcp, at most.
 const RX_QUEUE_MAX: usize = 256;
+/// Frames waiting for flush(), at most: past it they are written at once.
+const TX_QUEUE_MAX: usize = 256;
 
 /// A buffer-management cookie: the frame and its length.
 #[repr(C)]
@@ -220,6 +222,9 @@ pub struct Link {
     pub hw_type: u32,
     pub addr_bits: u32,
     pub(crate) rx: VecDeque<Box<Buf>>,
+    /// Frames sent while the stack held its lock, written by flush() once
+    /// it has let go (the device's reply to each write is waited for).
+    tx: VecDeque<Box<Buf>>,
     pub(crate) pool: Pool,
     pub stats: LinkStats,
     /// The stack's interface slot (the packet filter's tap names it).
@@ -280,6 +285,7 @@ impl Link {
             hw_type: 0,
             addr_bits: 48,
             rx: VecDeque::new(),
+            tx: VecDeque::new(),
             pool: Pool::default(),
             stats: LinkStats::default(),
             slot: 0,
@@ -488,25 +494,53 @@ impl Link {
             self.stats.tx_errors += 1;
             return (fill(&mut alloc::vec![0u8; len]), false);
         }
-        let r = fill(&mut self.write.buf.data[..len]);
+        let mut b = self.pool.take();
+        let r = fill(&mut b.data[..len]);
         // The IP filter hook may drop or replace it.
         let len = if filter {
-            match crate::ipf::filter(self.slot, &mut self.write.buf.data[..], len, false, None) {
+            match crate::ipf::filter(self.slot, &mut b.data[..], len, false, None) {
                 Some(n) => n,
-                None => return (r, false),
+                None => {
+                    self.pool.give(b);
+                    return (r, false);
+                }
             }
         } else {
             len
         };
-        let frame = &self.write.buf.data[..len];
+        let frame = &b.data[..len];
         // A monitoring hook (MHT_Packet) may drop it.
         if !crate::monitor::frame(frame, false) {
+            self.pool.give(b);
             return (r, false);
         }
         crate::bpf::tap(self.slot, frame, false);
+        // Written by flush(), after the stack has let go of its lock: the
+        // wait for each write's reply (1.7-5.3 us a frame on an X5000) was
+        // spent holding it.
+        b.len = len as u32;
+        self.tx.push_back(b);
+        if self.tx.len() >= TX_QUEUE_MAX {
+            self.flush();
+        }
+        (r, true)
+    }
+
+    /// Write the frames waiting in order, each waited for. A refused write
+    /// is dropped and counted (TCP sends it again).
+    pub fn flush(&mut self) {
+        while let Some(b) = self.tx.pop_front() {
+            let len = b.len as usize;
+            let old = core::mem::replace(&mut self.write.buf, b);
+            self.pool.give(old);
+            self.write_one(len);
+        }
+    }
+
+    fn write_one(&mut self, len: usize) {
         let err = self.write_now(len);
         if err == 0 {
-            return (r, true);
+            return;
         }
         // A refused write is dropped and counted; TCP sends it again.
         // p50x0_eth.device on the X5000 refuses writes with
@@ -519,7 +553,6 @@ impl Link {
             amigaos4::serial_println!("rsnet: write refused: io_Error {} wire error {} ({} bytes)", err as i8, self.write.r.wire_error(), len);
         }
         self.stats.tx_errors += 1;
-        (r, false)
     }
 
     /// Write the `len` bytes in the write request's buffer and wait for the
@@ -554,6 +587,8 @@ impl Link {
 
 impl Drop for Link {
     fn drop(&mut self) {
+        // What the last pass sent goes out first.
+        self.flush();
         self.closed = true;
         for r in &self.reads {
             // SAFETY: our requests, each in flight or replied: AbortIO on a

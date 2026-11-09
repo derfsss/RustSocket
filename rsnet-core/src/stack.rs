@@ -772,6 +772,19 @@ fn run(starter: Sender<Ctl>) {
     ready(Ok((port.sender(), core.clone())));
 
     loop {
+        // The drivers' replies first, before the lock: the links are this
+        // process's own (sides), and taking replies and posting the reads
+        // again is mostly the driver's work (a re-posted read is often
+        // answered inside BeginIO: the next frame copied in). Under the
+        // lock it was 40% of the pass on an X5000 while the program's
+        // recv() waited for the lock.
+        for side in sides.iter_mut() {
+            if let Some(link) = side.link.as_mut() {
+                let perf_t = crate::perf::now();
+                link.poll();
+                crate::perf::add(crate::perf::LINK_POLL, perf_t);
+            }
+        }
         // Held while working, let go of while sleeping. Never refused: no
         // other code in this task takes it.
         let perf_t = crate::perf::now();
@@ -816,9 +829,6 @@ fn run(starter: Sender<Ctl>) {
         let mut dns_changes: Vec<(usize, Vec<[u8; 4]>)> = Vec::new();
         for (k, (side, net)) in sides.iter_mut().zip(nets.iter_mut()).enumerate() {
             let Some(link) = side.link.as_mut() else { continue };
-            let perf_t = crate::perf::now();
-            link.poll();
-            crate::perf::add(crate::perf::LINK_POLL, perf_t);
             let perf_t = crate::perf::now();
             net.iface.poll(t, link, &mut net.sockets);
             crate::perf::add(crate::perf::IFACE_POLL, perf_t);
@@ -1246,6 +1256,12 @@ fn run(starter: Sender<Ctl>) {
             }
         }
         drop(guard);
+        // What this pass sent, written now that the lock is free.
+        for side in sides.iter_mut() {
+            if let Some(link) = side.link.as_mut() {
+                link.flush();
+            }
+        }
         if !queued {
             timer.start(TimerVal::from_micros(delay.max(1000)));
             count(PERF_SLEEPS);
