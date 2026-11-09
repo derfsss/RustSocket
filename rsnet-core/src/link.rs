@@ -385,15 +385,34 @@ impl Link {
         self.port.signal_mask()
     }
 
-    /// Take every read that has come back: frames into the queue, the reads
-    /// posted again.
+    /// Take the reads that have come back: frames into the queue, the reads
+    /// posted again. A re-posted read can come back inside this call (a
+    /// driver with frames waiting answers it at once): an X5000 with an
+    /// I210 took ~1,000 frames in one call, and every frame past
+    /// RX_QUEUE_MAX was dropped (~8% under two downloads). So this stops at
+    /// RX_QUEUE_MAX and leaves the other replies on the port for the next
+    /// pass, after smoltcp has emptied the queue; the port's signal is set
+    /// again so that pass comes at once (the stack sleeps on it, and the
+    /// replies left behind raise no new signal).
     pub fn poll(&mut self) {
-        while let Some(m) = self.port.get_raw() {
+        #[cfg(feature = "perf")]
+        let (q0, mut taken, mut dropped) = (self.rx.len(), 0u32, 0u32);
+        loop {
+            if self.rx.len() >= RX_QUEUE_MAX {
+                // SAFETY: SetSignal on the calling task's own signal bits.
+                unsafe { sys::exec_set_signal(self.port.signal_mask(), self.port.signal_mask()) };
+                break;
+            }
+            let Some(m) = self.port.get_raw() else { break };
             let Some(k) = self.reads.iter().position(|r| r.r.as_ptr() as *mut sys::Message == m) else {
                 continue;
             };
             let err = self.reads[k].r.io().error();
             if err == 0 {
+                #[cfg(feature = "perf")]
+                {
+                    taken += 1;
+                }
                 let n = (self.reads[k].buf.len as usize).min(FRAME_MAX);
                 if self.rx.len() < RX_QUEUE_MAX {
                     // The read takes a spare buffer; its own goes to the queue.
@@ -403,6 +422,10 @@ impl Link {
                     self.stats.rx_bytes += n as u64;
                 } else {
                     self.stats.rx_dropped += 1;
+                    #[cfg(feature = "perf")]
+                    {
+                        dropped += 1;
+                    }
                 }
             } else if err == IOERR_ABORTED {
                 continue;
@@ -413,6 +436,8 @@ impl Link {
                 self.post(k);
             }
         }
+        #[cfg(feature = "perf")]
+        crate::perf::link_poll(q0 as u32, taken, dropped);
     }
 
     /// Take `frame` in as if the device had just read it (a datagram the IP

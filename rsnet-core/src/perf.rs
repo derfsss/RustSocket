@@ -39,6 +39,26 @@ mod on {
         amigaos4::arch::timebase()
     }
 
+    static LP_POLLS: AtomicU32 = AtomicU32::new(0);
+    static LP_TAKEN: AtomicU32 = AtomicU32::new(0);
+    static LP_TAKEN_MAX: AtomicU32 = AtomicU32::new(0);
+    static LP_Q0_MAX: AtomicU32 = AtomicU32::new(0);
+    static LP_DROP_POLLS: AtomicU32 = AtomicU32::new(0);
+    static LP_DROPPED: AtomicU32 = AtomicU32::new(0);
+
+    /// One Link::poll: the queue length it found, the frames it took, the
+    /// frames it dropped.
+    pub fn link_poll(q0: u32, taken: u32, dropped: u32) {
+        LP_POLLS.fetch_add(1, Ordering::Relaxed);
+        LP_TAKEN.fetch_add(taken, Ordering::Relaxed);
+        LP_TAKEN_MAX.fetch_max(taken, Ordering::Relaxed);
+        LP_Q0_MAX.fetch_max(q0, Ordering::Relaxed);
+        if dropped > 0 {
+            LP_DROP_POLLS.fetch_add(1, Ordering::Relaxed);
+            LP_DROPPED.fetch_add(dropped, Ordering::Relaxed);
+        }
+    }
+
     #[inline]
     pub fn add(i: usize, since: u64) {
         let d = now().wrapping_sub(since) as u32;
@@ -81,6 +101,17 @@ mod on {
             let per_frame = if frames_in > 0 { ticks / speed as f64 * 1e6 / frames_in as f64 } else { 0.0 };
             amigaos4::serial_println!("rsnet perf:   {:<17} {:5.1}%  {:9} calls  {:7.2} us/call  {:6.2} us per frame in", NAMES[i], 100.0 * ticks / span as f64, calls, us_per, per_frame);
         }
+        // Link::poll: how many replied reads one call took (a driver with a
+        // backlog answers a re-posted read at once, inside the same call),
+        // the queue it found, and what it dropped at RX_QUEUE_MAX.
+        let polls = LP_POLLS.swap(0, Ordering::Relaxed);
+        let taken = LP_TAKEN.swap(0, Ordering::Relaxed);
+        amigaos4::serial_println!(
+            "rsnet perf:   link polls {}, frames taken {} ({:.1}/poll, most {} in one), queue at entry most {}, polls that dropped {}, frames dropped {}",
+            polls, taken, if polls > 0 { taken as f64 / polls as f64 } else { 0.0 },
+            LP_TAKEN_MAX.swap(0, Ordering::Relaxed), LP_Q0_MAX.swap(0, Ordering::Relaxed),
+            LP_DROP_POLLS.swap(0, Ordering::Relaxed), LP_DROPPED.swap(0, Ordering::Relaxed)
+        );
         // smoltcp's own phases (its rsnet-perf feature, same time base).
         for i in 0..smoltcp::perfhook::N {
             let (ticks, calls) = smoltcp::perfhook::take(i);
