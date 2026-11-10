@@ -130,6 +130,32 @@ Roadshow's file back returns to Roadshow.
 - The stack's device-free logic (the SANA-II extensions' bookkeeping), on
   the host: `cargo test` in `rsnet-core/host-tests`.
 
+## Reporting a problem
+
+Please raise problems on the
+[GitHub issues page](https://github.com/derfsss/RustSocket/issues).
+It helps to include:
+
+- **The machine and AmigaOS version**: for example an AmigaOne X5000 with
+  AmigaOS 4.1 Final Edition Update 3.
+- **rustsocket's version**: the output of
+  `Version bsdsocket.library FULL`.
+- **The network driver and its version**: for example
+  `Version DEVS:Networks/p50x0_eth.device FULL`, and the card it drives.
+- **What you did and what happened**: the program or command, what you
+  expected, what you got. Whether the same thing works under Roadshow
+  helps a lot.
+- **The debug output**: straight after the problem, before rebooting,
+  `DumpDebugBuffer >RAM:debug.txt`, and attach the file (or the lines
+  that start with `rustsocket.library` or `rsnet`).
+- **Your network set-up, if it matters**: the interface file from
+  `DEVS:NetInterfaces`, and the output of `ShowNetStatus` and
+  `RoadshowControl`.
+- **For a crash**: the crash report (Grim Reaper's details, or the
+  serial output if you capture it).
+- **For speed problems**: netprof's report (`testprogs/netprof`), or how
+  you measured, and the same measurement under Roadshow.
+
 ## Credits
 
 - [smoltcp-rs/smoltcp](https://github.com/smoltcp-rs/smoltcp): the TCP/IP

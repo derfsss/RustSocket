@@ -121,11 +121,17 @@ If the network is gone and you cannot get at the machine, uninstall from
 another boot (for example, boot without the startup-sequence and copy
 LIBS:bsdsocket.library.roadshow back).
 
-Please report:
+Please report problems on the GitHub issues page:
+
+    https://github.com/derfsss/RustSocket/issues
+
+and include:
   - the machine and the network driver (and its version),
-  - what you did and what happened,
+  - the output of "Version bsdsocket.library FULL",
+  - what you did and what happened, and whether it works under Roadshow,
   - RAM:debug.txt, or the lines from it that start with
-    "rustsocket.library" or "rsnet".
+    "rustsocket.library" or "rsnet",
+  - for a crash, the crash report.
 
 
 8. Licence
