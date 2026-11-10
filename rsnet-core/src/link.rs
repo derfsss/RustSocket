@@ -1216,7 +1216,8 @@ impl Link {
     /// frame a batch refuses is dropped and counted as a refused write is;
     /// those after it (untouched, the spec says) go in the next batch. A
     /// batch that takes nothing and refuses nothing leaves the frames to
-    /// plain writes (for good when the driver does not know the command).
+    /// plain writes (for good when the driver does not know the command
+    /// or calls the batch malformed).
     fn flush_batches(&mut self) {
         while !self.tx.is_empty() {
             let Some(tb) = self.tx_batch.as_mut() else { return };

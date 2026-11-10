@@ -7,8 +7,8 @@
 //! The extensions are the crate's `amigaos4::sana2ext` (unofficial, version
 //! 1; the rules are in the crate's docs/devices/sana2ext.md).
 
-use amigaos4::device::ioerr::{IOERR_ABORTED, IOERR_NOCMD};
-use amigaos4::sana2::S2ERR_NOT_SUPPORTED;
+use amigaos4::device::ioerr::{IOERR_ABORTED, IOERR_BADLENGTH, IOERR_NOCMD};
+use amigaos4::sana2::{S2ERR_BAD_ARGUMENT, S2ERR_NOT_SUPPORTED};
 use amigaos4::sana2ext::*;
 
 /// What a driver offers (its S2X_QUERY answer and capability items); all
@@ -109,8 +109,9 @@ pub enum ReadNext {
     Repost { error: bool },
     /// Aborted (the link is closing): leave it.
     Stop,
-    /// The driver does not take the command after all: plain CMD_READs
-    /// for this packet type instead.
+    /// The driver does not take the command after all, or refuses the
+    /// batch as malformed (posting it again would come straight back):
+    /// plain CMD_READs for this packet type instead.
     Fallback,
 }
 
@@ -121,7 +122,7 @@ pub fn read_outcome(count: usize, done: u32, err: i8) -> (usize, ReadNext) {
     let next = match err {
         0 => ReadNext::Repost { error: false },
         IOERR_ABORTED => ReadNext::Stop,
-        IOERR_NOCMD | S2ERR_NOT_SUPPORTED if filled == 0 => ReadNext::Fallback,
+        IOERR_NOCMD | S2ERR_NOT_SUPPORTED | S2ERR_BAD_ARGUMENT | IOERR_BADLENGTH if filled == 0 => ReadNext::Fallback,
         _ => ReadNext::Repost { error: true },
     };
     (filled, next)
@@ -142,7 +143,7 @@ pub struct WriteOutcome {
     /// one by one with CMD_WRITE.
     pub plain: bool,
     /// ... and stop using write batches on this link (the driver does not
-    /// take the command).
+    /// take the command, or calls the batch malformed).
     pub give_up: bool,
 }
 
@@ -166,7 +167,7 @@ pub fn write_outcome(count: usize, done: u32, err: i8, frame_err: i8) -> WriteOu
     o.resend_from = sent;
     if sent == 0 {
         o.plain = true;
-        o.give_up = matches!(err, IOERR_NOCMD | S2ERR_NOT_SUPPORTED);
+        o.give_up = matches!(err, IOERR_NOCMD | S2ERR_NOT_SUPPORTED | S2ERR_BAD_ARGUMENT | IOERR_BADLENGTH);
     }
     o
 }
@@ -501,6 +502,8 @@ mod tests {
         assert_eq!(read_outcome(16, 0, S2ERR_NOT_SUPPORTED), (0, ReadNext::Fallback));
         assert_eq!(read_outcome(16, 2, IOERR_NOCMD), (2, ReadNext::Repost { error: true }));
         assert_eq!(read_outcome(16, 0, 10), (0, ReadNext::Repost { error: true }));
+        assert_eq!(read_outcome(16, 0, S2ERR_BAD_ARGUMENT), (0, ReadNext::Fallback), "malformed: refused at BeginIO");
+        assert_eq!(read_outcome(16, 0, IOERR_BADLENGTH), (0, ReadNext::Fallback));
     }
 
     /// An Ethernet + IPv4 + TCP frame with `payload` bytes and correct
@@ -666,5 +669,7 @@ mod tests {
         assert_eq!((r.sent, r.resend_from, r.plain, r.give_up), (0, 0, true, true));
         let r = write_outcome(8, 0, 4, 0);
         assert_eq!((r.plain, r.give_up), (true, false), "no progress, no frame error");
+        let r = write_outcome(8, 0, S2ERR_BAD_ARGUMENT, 0);
+        assert_eq!((r.plain, r.give_up), (true, true), "malformed: refused at BeginIO");
     }
 }
