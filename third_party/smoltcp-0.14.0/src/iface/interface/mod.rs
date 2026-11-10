@@ -214,10 +214,21 @@ impl Interface {
 
         #[cfg(feature = "segmentation-offload")]
         // Segmentation offload requires checksum offload.
-        if [caps.segmentation.tcpv4, caps.segmentation.tcpv6]
-            .iter()
-            .any(Option::is_some)
-        {
+        // rustsocket patch: each field only when its protocol is built
+        // (tcpv6 does not exist without proto-ipv6).
+        if {
+            #[allow(unused_mut)]
+            let mut any = false;
+            #[cfg(all(feature = "socket-tcp", feature = "proto-ipv4"))]
+            {
+                any |= caps.segmentation.tcpv4.is_some();
+            }
+            #[cfg(all(feature = "socket-tcp", feature = "proto-ipv6"))]
+            {
+                any |= caps.segmentation.tcpv6.is_some();
+            }
+            any
+        } {
             assert!(
                 !caps.checksum.tcp.tx(),
                 "Device capabilities are inconsistent."

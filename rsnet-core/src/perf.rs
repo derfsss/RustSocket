@@ -81,9 +81,9 @@ mod on {
             return;
         }
         amigaos4::serial_println!(
-            "rsnet perf:   if {}: rx batches {} frames {} ({:.1}/batch), tx batches {} frames {} ({:.1}/batch), rx csum skipped {} bad {}, tx csum offloaded {}",
+            "rsnet perf:   if {}: rx batches {} frames {} ({:.1}/batch), tx batches {} frames {} ({:.1}/batch), rx csum skipped {} bad {}, tx csum offloaded {}, tso {} sends {} segments {} cut here",
             slot, s.rx_batches, s.rx_batch_frames, s.rx_batch_frames as f64 / s.rx_batches.max(1) as f64,
-            s.tx_batches, s.tx_batch_frames, s.tx_batch_frames as f64 / s.tx_batches.max(1) as f64, s.rx_csum_ok, s.rx_csum_bad, s.tx_csum_offloaded
+            s.tx_batches, s.tx_batch_frames, s.tx_batch_frames as f64 / s.tx_batches.max(1) as f64, s.rx_csum_ok, s.rx_csum_bad, s.tx_csum_offloaded, s.tso_sends, s.tso_segments, s.tso_soft
         );
     }
 

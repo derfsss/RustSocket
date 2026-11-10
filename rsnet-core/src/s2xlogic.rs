@@ -239,6 +239,12 @@ pub struct TxFill {
     pub flags: u32,
     pub start: u16,
     pub offset: u16,
+    /// Segmentation: the payload bytes of each segment (0: none) and the
+    /// header bytes (Ethernet, IPv4, TCP) repeated in each.
+    pub seg: u16,
+    pub hdr: u16,
+    /// The frame is to be cut by the link itself (the card's limits).
+    pub soft: bool,
 }
 
 /// The 16-bit ones' complement sum of `data` added to `sum`, folded.
@@ -297,6 +303,118 @@ pub fn tx_plan(frame: &mut [u8], offload: u32) -> TxFill {
         f.offset = 16;
     }
     f
+}
+
+/// TCP segmentation the driver offers (S2XCAP_SEGMENT, sanitised), as the
+/// stack uses it: the largest frame it hands over (the Ethernet header
+/// included, as smoltcp's SegmentationCapabilities counts it; the IPv4
+/// total length must fit its 16 bits), the most segments and the smallest
+/// segment size. None: no segmentation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tso {
+    pub max_frame: usize,
+    pub max_segments: u16,
+    pub min_seg: u16,
+}
+
+/// The segmentation the stack uses with this driver: TCP over IPv4 when
+/// the driver offers it with batches and both checksums the card fills
+/// (tx_offload: the IPv4 header and TCP).
+pub fn tso(c: &Caps) -> Option<Tso> {
+    let need = S2XCSUM_IPV4 | S2XCSUM_TCPV4;
+    if !c.batches() || c.seg_protocols & S2XCSUM_TCPV4 == 0 || tx_offload(c) & need != need {
+        return None;
+    }
+    let max_frame = (c.seg_max_size as usize).min(14 + 65535);
+    if max_frame <= 14 + 40 + 1 || c.seg_max_segments < 2 {
+        return None;
+    }
+    Some(Tso { max_frame, max_segments: c.seg_max_segments, min_seg: c.seg_min_seg })
+}
+
+/// Ready a large TCP frame smoltcp built for the card to cut into
+/// `seg`-byte segments (S2XFRAME_SEGMENT): as tx_plan, but the
+/// pseudo-header sum has a length of 0 (the card adds each segment's).
+/// The frame gets `seg` and the header length in its fill; a frame the
+/// card's limits refuse (too many segments, segments too small) gets
+/// `soft` instead: the link cuts it itself (tso_split).
+pub fn tx_plan_segment(frame: &mut [u8], seg: u16, t: &Tso) -> TxFill {
+    let mut f = tx_plan(frame, S2XCSUM_IPV4 | S2XCSUM_TCPV4);
+    if f.flags & S2XCS_FILL_L4 == 0 || seg == 0 {
+        return f;
+    }
+    let start = f.start as usize;
+    let hdr = start + ((frame[start + 12] >> 4) as usize) * 4;
+    if hdr > frame.len() {
+        return f;
+    }
+    let payload = frame.len() - hdr;
+    if payload <= seg as usize {
+        // One segment: an ordinary frame.
+        return f;
+    }
+    f.seg = seg;
+    f.hdr = hdr as u16;
+    let segments = payload.div_ceil(seg as usize);
+    if segments > t.max_segments as usize || seg < t.min_seg || frame.len() > t.max_frame {
+        f.soft = true;
+        return f;
+    }
+    let src = [frame[26], frame[27], frame[28], frame[29]];
+    let dst = [frame[30], frame[31], frame[32], frame[33]];
+    frame[start + 16..start + 18].copy_from_slice(&pseudo_sum(src, dst, 6, 0).to_be_bytes());
+    f
+}
+
+/// The number of segments tso_split makes of `frame` with `fill`.
+pub fn tso_count(frame: &[u8], fill: &TxFill) -> usize {
+    let hdr = fill.hdr as usize;
+    if fill.seg == 0 || hdr >= frame.len() {
+        return 1;
+    }
+    (frame.len() - hdr).div_ceil(fill.seg as usize)
+}
+
+/// Segment `k` of a large TCP frame, written into `out` (room for the
+/// headers and one segment): the headers repeated with the IPv4 total
+/// length, the IPv4 id (+k) and the TCP sequence number (+k * seg) set,
+/// FIN and PSH only on the last segment, CWR only on the first, and both
+/// checksums computed. What the card does with S2XFRAME_SEGMENT, for a
+/// frame that goes out without it. Returns the segment's length (0: no
+/// such segment, or no room for it in `out`).
+pub fn tso_split(frame: &[u8], fill: &TxFill, k: usize, out: &mut [u8]) -> usize {
+    let hdr = fill.hdr as usize;
+    let seg = fill.seg as usize;
+    let n = tso_count(frame, fill);
+    let from = hdr + k * seg;
+    if from >= frame.len() || hdr + seg.min(frame.len() - from) > out.len() {
+        return 0;
+    }
+    let len = seg.min(frame.len() - from);
+    out[..hdr].copy_from_slice(&frame[..hdr]);
+    out[hdr..hdr + len].copy_from_slice(&frame[from..from + len]);
+    let total = (hdr - 14 + len) as u16;
+    out[16..18].copy_from_slice(&total.to_be_bytes());
+    let id = u16::from_be_bytes([frame[18], frame[19]]).wrapping_add(k as u16);
+    out[18..20].copy_from_slice(&id.to_be_bytes());
+    let t = fill.start as usize;
+    let seq = u32::from_be_bytes([frame[t + 4], frame[t + 5], frame[t + 6], frame[t + 7]]).wrapping_add((k * seg) as u32);
+    out[t + 4..t + 8].copy_from_slice(&seq.to_be_bytes());
+    let mut flags = frame[t + 13];
+    if k + 1 < n {
+        flags &= !0x09; // FIN, PSH
+    }
+    if k > 0 {
+        flags &= !0x80; // CWR
+    }
+    out[t + 13] = flags;
+    let src = [out[26], out[27], out[28], out[29]];
+    let dst = [out[30], out[31], out[32], out[33]];
+    let l4 = (hdr - t + len) as u16;
+    out[t + 16..t + 18].copy_from_slice(&pseudo_sum(src, dst, 6, l4).to_be_bytes());
+    let size = hdr + len;
+    tx_software(&mut out[..size], TxFill { flags: S2XCS_FILL_IP | S2XCS_FILL_L4, start: fill.start, offset: 16, ..TxFill::default() });
+    size
 }
 
 /// Do what `fill` asked of the card, in software: for a frame that goes
@@ -513,12 +631,18 @@ mod tests {
     }
 
     fn tcp_frame_from(payload: usize, frag: u16, src: [u8; 4]) -> Vec<u8> {
+        tcp_frame_full(payload, 0, frag, src, 0xdeadbeef, 0x1234, 0x18)
+    }
+
+    /// The same with payload bytes `at..at + payload` of the test pattern,
+    /// sequence number, IPv4 id and TCP flags given.
+    fn tcp_frame_full(payload: usize, at: usize, frag: u16, src: [u8; 4], seq: u32, id: u16, flags: u8) -> Vec<u8> {
         let total = 20 + 20 + payload;
         let mut f = alloc::vec![0u8; 14 + total];
         f[12] = 0x08;
         f[14] = 0x45;
         f[16..18].copy_from_slice(&(total as u16).to_be_bytes());
-        f[18..20].copy_from_slice(&0x1234u16.to_be_bytes());
+        f[18..20].copy_from_slice(&id.to_be_bytes());
         f[20..22].copy_from_slice(&frag.to_be_bytes());
         f[22] = 64;
         f[23] = 6;
@@ -527,12 +651,12 @@ mod tests {
         let t = 34;
         f[t..t + 2].copy_from_slice(&4620u16.to_be_bytes());
         f[t + 2..t + 4].copy_from_slice(&80u16.to_be_bytes());
-        f[t + 4..t + 8].copy_from_slice(&0xdeadbeefu32.to_be_bytes());
+        f[t + 4..t + 8].copy_from_slice(&seq.to_be_bytes());
         f[t + 12] = 0x50;
-        f[t + 13] = 0x18;
+        f[t + 13] = flags;
         f[t + 14..t + 16].copy_from_slice(&0xffffu16.to_be_bytes());
         for (i, b) in f[t + 20..].iter_mut().enumerate() {
-            *b = (i * 7 + 3) as u8;
+            *b = ((at + i) * 7 + 3) as u8;
         }
         // Reference sums: word by word, carries folded at the end.
         let words = |d: &[u8]| -> u32 { d.chunks(2).map(|w| ((w[0] as u32) << 8) | *w.get(1).unwrap_or(&0) as u32).sum() };
@@ -568,7 +692,7 @@ mod tests {
             f[24..26].fill(0);
             f[50..52].fill(0);
             let fill = tx_plan(&mut f, S2XCSUM_IPV4 | S2XCSUM_TCPV4);
-            assert_eq!(fill, TxFill { flags: S2XCS_FILL_IP | S2XCS_FILL_L4, start: 34, offset: 16 });
+            assert_eq!(fill, TxFill { flags: S2XCS_FILL_IP | S2XCS_FILL_L4, start: 34, offset: 16, ..TxFill::default() });
             let ph = pseudo_sum([192, 168, 0, 26], [192, 168, 0, 156], 6, (20 + payload) as u16);
             assert_eq!(u16::from_be_bytes([f[50], f[51]]), ph, "pseudo-header sum in the field");
             card(&mut f, fill);
@@ -576,6 +700,57 @@ mod tests {
         }
     }
 
+
+    const TSO: Tso = Tso { max_frame: 14 + 65535, max_segments: 64, min_seg: 256 };
+
+    #[test]
+    fn segmentation_split() {
+        // 3500 bytes in 1000-byte segments, FIN|PSH|ACK|CWR on the large
+        // frame: four segments as a peer would get them from the card.
+        let flags = 0x80 | 0x18 | 0x01;
+        let big = tcp_frame_full(3500, 0, 0x4000, [192, 168, 0, 26], 0xfffffc00, 0xfffe, flags);
+        let mut f = big.clone();
+        let fill = tx_plan_segment(&mut f, 1000, &TSO);
+        assert_eq!((fill.seg, fill.hdr, fill.soft), (1000, 54, false));
+        assert_eq!(fill.flags, S2XCS_FILL_IP | S2XCS_FILL_L4);
+        let ph0 = pseudo_sum([192, 168, 0, 26], [192, 168, 0, 156], 6, 0);
+        assert_eq!(u16::from_be_bytes([f[50], f[51]]), ph0, "pseudo-header sum with a length of 0");
+        assert_eq!(tso_count(&f, &fill), 4);
+        let mut out = alloc::vec![0u8; 54 + 1000];
+        for k in 0..4 {
+            let n = tso_split(&f, &fill, k, &mut out);
+            let len = if k == 3 { 500 } else { 1000 };
+            let mut fl = flags;
+            if k < 3 {
+                fl &= !0x09;
+            }
+            if k > 0 {
+                fl &= !0x80;
+            }
+            let want = tcp_frame_full(len, k * 1000, 0x4000, [192, 168, 0, 26], 0xfffffc00u32.wrapping_add(k as u32 * 1000), 0xfffeu16.wrapping_add(k as u16), fl);
+            assert_eq!(&out[..n], &want[..], "segment {}", k);
+        }
+    }
+
+    #[test]
+    fn segmentation_limits() {
+        let mut small = tcp_frame(1000, 0);
+        let fill = tx_plan_segment(&mut small, 1460, &TSO);
+        assert_eq!((fill.seg, fill.soft), (0, false), "one segment: an ordinary frame");
+        assert_eq!(tso_count(&small, &fill), 1);
+        let mut many = tcp_frame(65 * 300, 0);
+        let fill = tx_plan_segment(&mut many, 300, &TSO);
+        assert_eq!((fill.seg, fill.soft), (300, true), "65 segments: cut by the link");
+        let mut tiny = tcp_frame(2000, 0);
+        let fill = tx_plan_segment(&mut tiny, 200, &TSO);
+        assert!(fill.soft, "segments under the card's least");
+        let c = Caps { present: true, version: 1, batch_frames: 64, tx_csum: S2XCSUM_IPV4 | S2XCSUM_TCPV4, seg_protocols: S2XCSUM_TCPV4, seg_max_size: 200_000, seg_max_segments: 64, seg_min_seg: 64, ..Caps::default() };
+        assert_eq!(tso(&c), Some(Tso { max_frame: 14 + 65535, max_segments: 64, min_seg: 64 }));
+        assert_eq!(tso(&Caps { tx_csum: S2XCSUM_TCPV4, ..c }), None, "the IPv4 header sum is needed too");
+        assert_eq!(tso(&Caps { batch_frames: 0, ..c }), None);
+        assert_eq!(tso(&Caps { seg_protocols: S2XCSUM_TCPV6, ..c }), None);
+        assert_eq!(tso(&Caps { seg_max_size: 16384, ..c }).map(|t| t.max_frame), Some(16384));
+    }
 
     #[test]
     fn tx_checksum_after_nat() {

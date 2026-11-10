@@ -37,8 +37,8 @@ from Roadshow on purpose.
   (see Settings in docs/roadshow-compat.md).
 - The unofficial SANA-II extensions (sana2ext, version 1), with a driver
   that offers them: frames read and written in batches, checksums
-  checked and computed by the card. Any other driver is used through
-  plain SANA-II.
+  checked and computed by the card, large TCP sends cut into segments by
+  the card. Any other driver is used through plain SANA-II.
 
 ## Speed
 

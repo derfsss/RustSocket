@@ -37,6 +37,10 @@ smoltcp = { version = "0.14.0", default-features = false, features = [
     "fragmentation-buffer-size-16384",
     "reassembly-buffer-size-16384",
     "reassembly-buffer-count-2",
+    # TCP sends larger than the MTU for a driver that segments them
+    # (SANA-II extensions, S2XFRAME_SEGMENT); off unless the link offers
+    # it in its device capabilities.
+    "segmentation-offload",
 ] }
 
 [features]

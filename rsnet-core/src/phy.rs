@@ -43,8 +43,9 @@ impl RxToken for Rx {
     }
 }
 
-/// The right to send one frame on the link.
-pub struct Tx<'a>(&'a mut Link);
+/// The right to send one frame on the link, and the segment size smoltcp
+/// asks for (a TCP send larger than the MTU: the card cuts it).
+pub struct Tx<'a>(&'a mut Link, Option<u16>);
 
 impl TxToken for Tx<'_> {
     fn consume<R, F>(self, len: usize, f: F) -> R
@@ -52,12 +53,16 @@ impl TxToken for Tx<'_> {
         F: FnOnce(&mut [u8]) -> R,
     {
         self.0
-            .send_stack(len, |b| {
+            .send_stack(len, self.1, |b| {
                 let r = f(b);
                 crate::stats::frame(b, false);
                 r
             })
             .0
+    }
+
+    fn set_meta(&mut self, meta: PacketMeta) {
+        self.1 = meta.segmentation_offload_size.map(|s| s.get());
     }
 }
 
@@ -182,11 +187,11 @@ impl Device for Link {
             self.pool.give(f);
         };
         let pool = self.pool.clone();
-        Some((Rx(f, pool), Tx(self)))
+        Some((Rx(f, pool), Tx(self, None)))
     }
 
     fn transmit(&mut self, _now: Instant) -> Option<Self::TxToken<'_>> {
-        Some(Tx(self))
+        Some(Tx(self, None))
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -203,6 +208,10 @@ impl Device for Link {
         }
         if self.tx_offload & S2XCSUM_TCPV4 != 0 {
             c.checksum.tcp = Checksum::Rx;
+        }
+        // TCP sends up to the card's largest frame, cut by the card.
+        if let Some(t) = self.tso {
+            c.segmentation.tcpv4 = core::num::NonZeroUsize::new(t.max_frame);
         }
         c
     }

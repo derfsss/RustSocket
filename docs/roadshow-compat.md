@@ -112,6 +112,10 @@ and plain SANA-II otherwise:
 - the IPv4 header and TCP checksums of frames sent are computed by the
   card. Monitoring hooks, bpf (tcpdump) and the filter hook see those
   frames before the card has filled the fields in;
+- TCP sends larger than the MTU, cut into segments by the card
+  (S2XFRAME_SEGMENT), up to the largest frame it takes; the stack cuts a
+  send itself when it is past the card's limits. Monitoring hooks and bpf
+  see the large send as one frame;
 - MTU: an MTU larger than the driver's (the MTU option of
   DEVS:NetInterfaces, ConfigureNetInterface MTU) changes the driver's MTU,
   within what it allows (jumbo frames). Roadshow, like rustsocket with

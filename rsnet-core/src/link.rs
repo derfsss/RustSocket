@@ -48,7 +48,7 @@ use amigaos4::device::cmd::{CMD_READ, CMD_WRITE, NSCMD_DEVICEQUERY};
 use amigaos4::device::ioerr::IOERR_ABORTED;
 use amigaos4::port::AmigaMsgPort;
 use amigaos4::sana2::*;
-use amigaos4::sana2ext::{self as s2x, MinList, S2XBatch, S2XFrame, S2XFrameChecksum, S2XItem, S2XQuery};
+use amigaos4::sana2ext::{self as s2x, MinList, S2XBatch, S2XFrame, S2XFrameChecksum, S2XItem, S2XQuery, S2XCSUM_TCPV4};
 use amigaos4::sys::{self, TagItem};
 
 use crate::s2xlogic::{self, Caps, ReadNext, RxCsum, TxFill};
@@ -95,7 +95,7 @@ pub struct Buf {
 
 impl Buf {
     fn new(size: usize) -> Box<Self> {
-        Box::new(Buf { len: 0, data: alloc::vec![0u8; size].into_boxed_slice(), trust: 0, fill: TxFill { flags: 0, start: 0, offset: 0 } })
+        Box::new(Buf { len: 0, data: alloc::vec![0u8; size].into_boxed_slice(), trust: 0, fill: TxFill::default() })
     }
 
     /// The frame it holds.
@@ -125,11 +125,15 @@ pub struct Pool(Rc<RefCell<PoolIn>>);
 struct PoolIn {
     bufs: Vec<Box<Buf>>,
     size: usize,
+    /// Large send buffers (TCP segmentation by the card), of `big_size`
+    /// (0: none).
+    big: Vec<Box<Buf>>,
+    big_size: usize,
 }
 
 impl Default for Pool {
     fn default() -> Self {
-        Pool(Rc::new(RefCell::new(PoolIn { bufs: Vec::new(), size: FRAME_MAX })))
+        Pool(Rc::new(RefCell::new(PoolIn { bufs: Vec::new(), size: FRAME_MAX, big: Vec::new(), big_size: 0 })))
     }
 }
 
@@ -144,11 +148,33 @@ impl Pool {
         b
     }
 
-    /// Hand a buffer back for the next read.
+    /// A large send buffer (big_size).
+    fn take_big(&self) -> Box<Buf> {
+        let mut p = self.0.borrow_mut();
+        let size = p.big_size;
+        let mut b = p.big.pop().unwrap_or_else(|| Buf::new(size));
+        b.trust = 0;
+        b.fill = TxFill::default();
+        b.len = 0;
+        b
+    }
+
+    /// Hand a buffer back for the next read (or the next large send).
     pub fn give(&self, b: Box<Buf>) {
         let mut p = self.0.borrow_mut();
         if b.size() == p.size {
             p.bufs.push(b);
+        } else if b.size() == p.big_size {
+            p.big.push(b);
+        }
+    }
+
+    /// Large send buffers of `size` from now on.
+    fn set_big(&self, size: usize) {
+        let mut p = self.0.borrow_mut();
+        if p.big_size != size {
+            p.big_size = size;
+            p.big.clear();
         }
     }
 
@@ -277,6 +303,7 @@ impl Req {
 struct Slot {
     frame: S2XFrame,
     csum: S2XFrameChecksum,
+    seg: s2x::S2XFrameSegment,
     req: Req,
 }
 
@@ -329,6 +356,7 @@ impl Batch {
                     s2xf_Reserved: 0,
                 },
                 csum: S2XFrameChecksum { s2xfc_Header: S2XItem::new(s2x::S2XFRAME_CHECKSUM, size_of::<S2XFrameChecksum>()), s2xfc_Flags: 0, s2xfc_Start: 0, s2xfc_Offset: 0 },
+                seg: s2x::S2XFrameSegment { s2xfs_Header: S2XItem::new(s2x::S2XFRAME_SEGMENT, size_of::<s2x::S2XFrameSegment>()), s2xfs_Protocol: 0, s2xfs_SegSize: 0, s2xfs_HdrLen: 0 },
                 req: r,
             }));
         }
@@ -360,6 +388,13 @@ impl Batch {
                     s.csum.s2xfc_Start = fill.start;
                     s.csum.s2xfc_Offset = fill.offset;
                     MinList::add_tail(items, addr_of_mut!(s.csum.s2xfc_Header.s2xi_Node));
+                }
+                // Segmentation after the checksum item (ascending types).
+                if self.csum_item && cmd == s2x::S2X_WRITEBATCH && fill.seg != 0 && !fill.soft {
+                    s.seg.s2xfs_Protocol = S2XCSUM_TCPV4;
+                    s.seg.s2xfs_SegSize = fill.seg;
+                    s.seg.s2xfs_HdrLen = fill.hdr;
+                    MinList::add_tail(items, addr_of_mut!(s.seg.s2xfs_Header.s2xi_Node));
                 }
                 MinList::add_tail(list, addr_of_mut!(s.frame.s2xf_Node));
             }
@@ -515,6 +550,12 @@ pub struct LinkStats {
     pub rx_csum_bad: u32,
     /// Frames sent with checksums left to the card.
     pub tx_csum_offloaded: u32,
+    /// Large TCP sends handed to the card to cut (S2XFRAME_SEGMENT), the
+    /// segments they make, and large sends cut by the link itself (past
+    /// the card's limits, or written without a batch).
+    pub tso_sends: u32,
+    pub tso_segments: u32,
+    pub tso_soft: u32,
 }
 
 /// An opened SANA-II unit with its reads pending.
@@ -536,6 +577,8 @@ pub struct Link {
     /// The checksums left to the card on send (s2xlogic::tx_offload);
     /// smoltcp does not compute them.
     pub tx_offload: u32,
+    /// TCP segmentation by the card (s2xlogic::tso), if used.
+    pub tso: Option<s2xlogic::Tso>,
     write: Req,
     /// The buffer-management tags, read by OpenDevice.
     _tags: Box<[TagItem; 3]>,
@@ -611,6 +654,7 @@ impl Link {
             caps: Caps::default(),
             hw: s2xlogic::HwSettings::default(),
             tx_offload: 0,
+            tso: None,
             write,
             _tags: tags,
             mac: mac.unwrap_or([0; 6]),
@@ -647,6 +691,10 @@ impl Link {
             }
             let per = TX_PER_BATCH.min(max as usize).max(1);
             link.tx_offload = s2xlogic::tx_offload(&link.caps);
+            link.tso = s2xlogic::tso(&link.caps);
+            if let Some(t) = link.tso {
+                link.pool.set_big(t.max_frame);
+            }
             link.tx_batch = Some(Batch::new(&link.port, &link.base, per, link.pool.size(), 0, link.tx_offload != 0)?);
             link.tx_batch_on = true;
             for k in 0..link.rx_batches.len() {
@@ -1138,28 +1186,34 @@ impl Link {
     /// longer than the link's frame size is not sent (`fill` runs on a
     /// scratch buffer).
     pub fn send_with<R>(&mut self, len: usize, fill: impl FnOnce(&mut [u8]) -> R) -> (R, bool) {
-        self.send_inner(len, fill, true, false)
+        self.send_inner(len, fill, true, None)
     }
 
     /// As send_with, for a frame smoltcp built: the checksums in
     /// tx_offload are still to be done (by the card, or here when the
     /// frame goes out as a plain write).
-    pub(crate) fn send_stack<R>(&mut self, len: usize, fill: impl FnOnce(&mut [u8]) -> R) -> (R, bool) {
-        self.send_inner(len, fill, true, true)
+    /// `seg`: smoltcp asks for segments of that many payload bytes (a send
+    /// larger than the MTU, with TCP segmentation offered).
+    pub(crate) fn send_stack<R>(&mut self, len: usize, seg: Option<u16>, fill: impl FnOnce(&mut [u8]) -> R) -> (R, bool) {
+        self.send_inner(len, fill, true, Some(seg))
     }
 
     /// Send one whole frame without the IP filter (a datagram its "to" /
     /// "dup-to" rule routes: ipfil.rs).
     pub(crate) fn send_unfiltered(&mut self, frame: &[u8]) -> bool {
-        self.send_inner(frame.len(), |b| b.copy_from_slice(frame), false, false).1
+        self.send_inner(frame.len(), |b| b.copy_from_slice(frame), false, None).1
     }
 
-    fn send_inner<R>(&mut self, len: usize, fill: impl FnOnce(&mut [u8]) -> R, filter: bool, stack: bool) -> (R, bool) {
-        if len < 14 || len > self.pool.size() {
+    /// `stack`: a frame smoltcp built (Some), with the segment size it
+    /// asks for.
+    fn send_inner<R>(&mut self, len: usize, fill: impl FnOnce(&mut [u8]) -> R, filter: bool, stack: Option<Option<u16>>) -> (R, bool) {
+        let seg = stack.flatten().filter(|_| self.tso.is_some());
+        let big = seg.is_some() && len > self.pool.size() && self.tso.map(|t| len <= t.max_frame).unwrap_or(false);
+        if len < 14 || (len > self.pool.size() && !big) {
             self.stats.tx_errors += 1;
             return (fill(&mut alloc::vec![0u8; len]), false);
         }
-        let mut b = self.pool.take();
+        let mut b = if big { self.pool.take_big() } else { self.pool.take() };
         let r = fill(&mut b.data[..len]);
         // The IP filter hook may drop or replace it.
         let len = if filter {
@@ -1177,8 +1231,11 @@ impl Link {
         // may change addresses and ports) on the frame as it goes out. A
         // monitoring hook, bpf and the filter hook see the frame without
         // them, as with checksum offload elsewhere.
-        if stack && self.tx_offload != 0 {
-            b.fill = s2xlogic::tx_plan(&mut b.data[..len], self.tx_offload);
+        if stack.is_some() && self.tx_offload != 0 {
+            b.fill = match (seg, self.tso) {
+                (Some(s), Some(t)) => s2xlogic::tx_plan_segment(&mut b.data[..len], s, &t),
+                _ => s2xlogic::tx_plan(&mut b.data[..len], self.tx_offload),
+            };
         }
         let frame = &b.data[..len];
         // A monitoring hook (MHT_Packet) may drop it.
@@ -1191,7 +1248,18 @@ impl Link {
         // wait for each write's reply (1.7-5.3 us a frame on an X5000) was
         // spent holding it.
         b.len = len as u32;
-        self.tx.push_back(b);
+        if b.fill.seg != 0 && b.fill.soft {
+            // Past the card's limits: cut here, the segments queued as
+            // ordinary frames.
+            self.queue_split(&b);
+            self.pool.give(b);
+        } else {
+            if b.fill.seg != 0 {
+                self.stats.tso_sends += 1;
+                self.stats.tso_segments += s2xlogic::tso_count(b.frame(), &b.fill) as u32;
+            }
+            self.tx.push_back(b);
+        }
         if self.tx.len() >= TX_QUEUE_MAX {
             self.flush();
         }
@@ -1205,6 +1273,12 @@ impl Link {
             self.flush_batches();
         }
         while let Some(b) = self.tx.pop_front() {
+            if b.fill.seg != 0 {
+                // A large send going out without a batch: cut here.
+                self.write_split(&b);
+                self.pool.give(b);
+                continue;
+            }
             let len = b.len as usize;
             let old = core::mem::replace(&mut self.write.buf, b);
             self.pool.give(old);
@@ -1278,6 +1352,40 @@ impl Link {
                 return;
             }
         }
+    }
+
+    /// The segments of large send `b` (s2xlogic::tso_split), queued as
+    /// ordinary frames with their sums done.
+    fn queue_split(&mut self, b: &Buf) {
+        let n = s2xlogic::tso_count(b.frame(), &b.fill);
+        for k in 0..n {
+            let mut s = self.pool.take();
+            let len = s2xlogic::tso_split(b.frame(), &b.fill, k, &mut s.data);
+            if len == 0 {
+                self.stats.tx_errors += 1;
+                self.pool.give(s);
+                continue;
+            }
+            s.len = len as u32;
+            self.tx.push_back(s);
+        }
+        self.stats.tso_soft += 1;
+    }
+
+    /// The segments of large send `b`, written one by one.
+    fn write_split(&mut self, b: &Buf) {
+        let n = s2xlogic::tso_count(b.frame(), &b.fill);
+        for k in 0..n {
+            let len = s2xlogic::tso_split(b.frame(), &b.fill, k, &mut self.write.buf.data);
+            if len == 0 {
+                self.stats.tx_errors += 1;
+                continue;
+            }
+            self.write.buf.fill = TxFill::default();
+            self.write.buf.len = len as u32;
+            self.write_one(len);
+        }
+        self.stats.tso_soft += 1;
     }
 
     fn write_one(&mut self, len: usize) {
