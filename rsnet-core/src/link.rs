@@ -304,6 +304,7 @@ struct Slot {
     frame: S2XFrame,
     csum: S2XFrameChecksum,
     seg: s2x::S2XFrameSegment,
+    rss: s2x::S2XFrameRSS,
     req: Req,
 }
 
@@ -317,6 +318,11 @@ struct Batch {
     ptype: u32,
     /// Link each frame's S2XFRAME_CHECKSUM item.
     csum_item: bool,
+    /// Link each read frame's S2XFRAME_RSS item.
+    rss_item: bool,
+    /// The receive or transmit queue (s2xb_Queue; 0 without RSS). Batches
+    /// of one queue could be served by a task of their own.
+    queue: u32,
     /// Sent and not yet back.
     in_flight: bool,
     /// The driver refused the command: no longer used.
@@ -324,7 +330,7 @@ struct Batch {
 }
 
 impl Batch {
-    fn new(port: &AmigaMsgPort, base: &Req, frames: usize, size: usize, ptype: u32, csum_item: bool) -> Result<Self, String> {
+    fn new(port: &AmigaMsgPort, base: &Req, frames: usize, size: usize, ptype: u32, csum_item: bool, queue: u32, rss_item: bool) -> Result<Self, String> {
         let req = Link::copy_of(port, base)?;
         let batch = Box::new(S2XBatch {
             s2xb_Size: size_of::<S2XBatch>() as u32,
@@ -333,7 +339,7 @@ impl Batch {
             s2xb_Done: 0,
             s2xb_Queue: 0,
         });
-        let mut b = Batch { req, batch, slots: Vec::with_capacity(frames), ptype, csum_item, in_flight: false, dead: false };
+        let mut b = Batch { req, batch, slots: Vec::with_capacity(frames), ptype, csum_item, rss_item, queue, in_flight: false, dead: false };
         for _ in 0..frames {
             let r = match Link::copy_of(port, base) {
                 Ok(mut r) => {
@@ -357,6 +363,7 @@ impl Batch {
                 },
                 csum: S2XFrameChecksum { s2xfc_Header: S2XItem::new(s2x::S2XFRAME_CHECKSUM, size_of::<S2XFrameChecksum>()), s2xfc_Flags: 0, s2xfc_Start: 0, s2xfc_Offset: 0 },
                 seg: s2x::S2XFrameSegment { s2xfs_Header: S2XItem::new(s2x::S2XFRAME_SEGMENT, size_of::<s2x::S2XFrameSegment>()), s2xfs_Protocol: 0, s2xfs_SegSize: 0, s2xfs_HdrLen: 0 },
+                rss: s2x::S2XFrameRSS { s2xfr_Header: S2XItem::new(s2x::S2XFRAME_RSS, size_of::<s2x::S2XFrameRSS>()), s2xfr_Hash: 0, s2xfr_HashType: 0 },
                 req: r,
             }));
         }
@@ -396,13 +403,19 @@ impl Batch {
                     s.seg.s2xfs_HdrLen = fill.hdr;
                     MinList::add_tail(items, addr_of_mut!(s.seg.s2xfs_Header.s2xi_Node));
                 }
+                // The card's hash, last (ascending types), cleared.
+                if self.rss_item && cmd == s2x::S2X_READBATCH {
+                    s.rss.s2xfr_Hash = 0;
+                    s.rss.s2xfr_HashType = 0;
+                    MinList::add_tail(items, addr_of_mut!(s.rss.s2xfr_Header.s2xi_Node));
+                }
                 MinList::add_tail(list, addr_of_mut!(s.frame.s2xf_Node));
             }
         }
         self.batch.s2xb_Size = size_of::<S2XBatch>() as u32;
         self.batch.s2xb_Count = count as u32;
         self.batch.s2xb_Done = 0;
-        self.batch.s2xb_Queue = 0;
+        self.batch.s2xb_Queue = self.queue;
         self.req.set(cmd, SANA2IOF_RAW);
         self.req.r.set_data(null_mut());
         self.req.r.set_data_length(0);
@@ -556,6 +569,10 @@ pub struct LinkStats {
     pub tso_sends: u32,
     pub tso_segments: u32,
     pub tso_soft: u32,
+    /// Received frames that carried the card's RSS hash, and the frames
+    /// each receive queue brought (the last counts every queue from 7 on).
+    pub rx_rss_hashed: u32,
+    pub rx_queue_frames: [u32; 8],
 }
 
 /// An opened SANA-II unit with its reads pending.
@@ -574,6 +591,12 @@ pub struct Link {
     pub caps: Caps,
     /// The unit's settings as the driver reported them.
     pub hw: s2xlogic::HwSettings,
+    /// The settings as read at open, and those this link changed (the
+    /// values it set): put back at close (s2xlogic::restore_plan).
+    opened: s2xlogic::HwSettings,
+    mine: s2xlogic::HwSettings,
+    /// RSS receive queues in use (1: none).
+    pub rss_queues: u16,
     /// The checksums left to the card on send (s2xlogic::tx_offload);
     /// smoltcp does not compute them.
     pub tx_offload: u32,
@@ -653,6 +676,9 @@ impl Link {
             tx_batch_on: false,
             caps: Caps::default(),
             hw: s2xlogic::HwSettings::default(),
+            opened: s2xlogic::HwSettings::default(),
+            mine: s2xlogic::HwSettings::default(),
+            rss_queues: 1,
             tx_offload: 0,
             tso: None,
             write,
@@ -678,24 +704,47 @@ impl Link {
         link.write.buf = link.pool.take();
         link.caps = discover(&mut link.base);
         link.read_settings();
+        link.opened = link.hw;
         if link.caps.batches() {
             link.report_caps(device, unit);
             let max = link.caps.batch_frames;
             let csum = link.caps.rx_csum != 0;
-            for (ptype, want, prefer) in [(0x0800u32, IPV4_BATCH_FRAMES, IPV4_PER_BATCH), (0x0806, ARP_BATCH_FRAMES, ARP_PER_BATCH)] {
-                let (n, per) = s2xlogic::plan_reads(want, max, prefer);
-                for _ in 0..n {
-                    let b = Batch::new(&link.port, &link.base, per, link.pool.size(), ptype, csum)?;
-                    link.rx_batches.push(b);
+            // RSS (option if.rss.queues, off by default: one CPU).
+            let want = crate::settings::get("if.rss.queues").unwrap_or(1);
+            if let Some(plan) = s2xlogic::rss_plan(&link.caps, want) {
+                match link.configure(false, None, None, None, Some(plan)) {
+                    Ok(()) => {
+                        let q = link.hw.rss_queues.unwrap_or(plan.0).clamp(1, s2xlogic::RSS_QUEUES_MAX);
+                        link.rss_queues = q;
+                        link.mine.rss_queues = Some(q);
+                        amigaos4::serial_println!("rsnet: {} unit {}: RSS on {} receive queues (hash types {:#x})", device, unit, q, plan.1);
+                    }
+                    Err((e, ty)) => amigaos4::serial_println!("rsnet: {} unit {}: S2XSET_RSS refused: io_Error {} item {:#06x}", device, unit, e, ty),
+                }
+            }
+            let nq = link.rss_queues;
+            // Every queue gets reads of both types: the card decides which
+            // queue a frame goes on, unhashed frames included.
+            for queue in 0..nq {
+                for (ptype, want, prefer) in [(0x0800u32, IPV4_BATCH_FRAMES, IPV4_PER_BATCH), (0x0806, ARP_BATCH_FRAMES, ARP_PER_BATCH)] {
+                    let (n, per) = s2xlogic::plan_reads(s2xlogic::per_queue(want, nq), max, prefer);
+                    for _ in 0..n {
+                        let b = Batch::new(&link.port, &link.base, per, link.pool.size(), ptype, csum, queue as u32, nq > 1)?;
+                        link.rx_batches.push(b);
+                    }
                 }
             }
             let per = TX_PER_BATCH.min(max as usize).max(1);
-            link.tx_offload = s2xlogic::tx_offload(&link.caps);
-            link.tso = s2xlogic::tso(&link.caps);
+            // Option if.txcsum: the checksums the card may fill (1: the
+            // IPv4 header, 2: TCP; 0: none).
+            let allow = crate::settings::get("if.txcsum").unwrap_or(3) as u32 & (s2x::S2XCSUM_IPV4 | S2XCSUM_TCPV4);
+            link.tx_offload = s2xlogic::tx_offload(&link.caps) & allow;
+            let both = s2x::S2XCSUM_IPV4 | S2XCSUM_TCPV4;
+            link.tso = if link.tx_offload & both == both { s2xlogic::tso(&link.caps) } else { None };
             if let Some(t) = link.tso {
                 link.pool.set_big(t.max_frame);
             }
-            link.tx_batch = Some(Batch::new(&link.port, &link.base, per, link.pool.size(), 0, link.tx_offload != 0)?);
+            link.tx_batch = Some(Batch::new(&link.port, &link.base, per, link.pool.size(), 0, link.tx_offload != 0, 0, false)?);
             link.tx_batch_on = true;
             for k in 0..link.rx_batches.len() {
                 link.post_batch(k);
@@ -762,6 +811,10 @@ impl Link {
             }
             let n = (s.req.buf.len as usize).min(s.req.buf.size());
             let flags = if b.csum_item { s.csum.s2xfc_Flags } else { 0 };
+            if b.rss_item && s.rss.s2xfr_HashType != 0 {
+                self.stats.rx_rss_hashed += 1;
+            }
+            self.stats.rx_queue_frames[(b.queue as usize).min(7)] += 1;
             // The frame's buffer goes to the queue, a spare one takes its
             // place (set as the cookie when the batch is posted again).
             let mut full = core::mem::replace(&mut s.req.buf, self.pool.take());
@@ -815,11 +868,22 @@ impl Link {
     /// `read` reads the current values instead of changing them. The
     /// values the driver reports (read, or written back after a change)
     /// go into `hw`. Err: (io_Error, the refused item's type or 0).
-    fn configure(&mut self, read: bool, mtu: Option<u32>, moderation: Option<(u32, u32)>, flow: Option<u32>) -> Result<(), (i8, u32)> {
+    /// `rss`: (receive queues, hash types), the key and table left to the
+    /// driver.
+    fn configure(&mut self, read: bool, mtu: Option<u32>, moderation: Option<(u32, u32)>, flow: Option<u32>, rss: Option<(u16, u32)>) -> Result<(), (i8, u32)> {
         let mut m = Box::new(s2x::S2XSetMTU { s2xsm_Header: S2XItem::new(s2x::S2XSET_MTU, size_of::<s2x::S2XSetMTU>()), s2xsm_MTU: mtu.unwrap_or(0), s2xsm_Reserved: 0 });
         let (rx, tx) = moderation.unwrap_or((0, 0));
         let mut o = Box::new(s2x::S2XSetModeration { s2xso_Header: S2XItem::new(s2x::S2XSET_MODERATION, size_of::<s2x::S2XSetModeration>()), s2xso_RxMicros: rx, s2xso_TxMicros: tx });
         let mut f = Box::new(s2x::S2XSetFlowControl { s2xsf_Header: S2XItem::new(s2x::S2XSET_FLOWCONTROL, size_of::<s2x::S2XSetFlowControl>()), s2xsf_Modes: flow.unwrap_or(0), s2xsf_Reserved: 0 });
+        let (queues, hash) = rss.unwrap_or((1, 0));
+        let mut q = Box::new(s2x::S2XSetRSS {
+            s2xsr_Header: S2XItem::new(s2x::S2XSET_RSS, size_of::<s2x::S2XSetRSS>()),
+            s2xsr_HashTypes: hash,
+            s2xsr_Queues: queues,
+            s2xsr_TableSize: self.caps.rss_table,
+            s2xsr_Key: null_mut(),
+            s2xsr_Table: null_mut(),
+        });
         let mut c = Box::new(s2x::S2XConfigure {
             s2xc_Size: size_of::<s2x::S2XConfigure>() as u32,
             s2xc_Flags: if read { s2x::S2XCF_READ } else { 0 },
@@ -839,6 +903,9 @@ impl Link {
             }
             if flow.is_some() {
                 MinList::add_tail(list, addr_of_mut!(f.s2xsf_Header.s2xi_Node));
+            }
+            if rss.is_some() {
+                MinList::add_tail(list, addr_of_mut!(q.s2xsr_Header.s2xi_Node));
             }
             if MinList::is_empty(list) {
                 return Ok(());
@@ -867,7 +934,30 @@ impl Link {
         if flow.is_some() {
             self.hw.flow_control = Some(f.s2xsf_Modes);
         }
+        if rss.is_some() {
+            self.hw.rss_queues = Some(q.s2xsr_Queues);
+        }
         Ok(())
+    }
+
+    /// At close, with no read posted: the settings this link changed back
+    /// to what they were at open, those someone else changed since left.
+    fn restore_settings(&mut self) {
+        let m = self.mine;
+        if m.mtu.is_none() && m.moderation.is_none() && m.flow_control.is_none() && m.rss_queues.is_none() {
+            return;
+        }
+        self.read_settings();
+        let p = s2xlogic::restore_plan(&self.opened, &m, &self.hw);
+        let hash = self.caps.rss_hash & (s2x::S2XRSS_IPV4 | s2x::S2XRSS_TCPV4 | s2x::S2XRSS_UDPV4);
+        let rss = p.rss_queues.map(|q| (q, if q > 1 { hash } else { 0 }));
+        if p.mtu.is_none() && p.moderation.is_none() && p.flow_control.is_none() && rss.is_none() {
+            return;
+        }
+        match self.configure(false, p.mtu, p.moderation, p.flow_control, rss) {
+            Ok(()) => amigaos4::serial_println!("rsnet: interface {}: settings put back: {:?}", self.slot, p),
+            Err((e, ty)) => amigaos4::serial_println!("rsnet: interface {}: settings not put back: io_Error {} item {:#06x}", self.slot, e, ty),
+        }
     }
 
     /// Read the unit's settings the driver offers into `hw`.
@@ -879,7 +969,8 @@ impl Link {
         let mtu = (c.mtu_max > 0).then_some(0);
         let modr = c.moderation.then_some((0, 0));
         let fc = c.flow_control.then_some(0);
-        if let Err((e, ty)) = self.configure(true, mtu, modr, fc) {
+        let rss = (c.rss_queues > 0).then_some((0, 0));
+        if let Err((e, ty)) = self.configure(true, mtu, modr, fc, rss) {
             amigaos4::serial_println!("rsnet: S2X_CONFIGURE (read) refused: io_Error {} item {:#06x}", e, ty);
         }
     }
@@ -893,8 +984,14 @@ impl Link {
         if m.is_none() && f.is_none() {
             return false;
         }
-        match self.configure(false, None, m, f) {
+        match self.configure(false, None, m, f, None) {
             Ok(()) => {
+                if m.is_some() {
+                    self.mine.moderation = self.hw.moderation;
+                }
+                if f.is_some() {
+                    self.mine.flow_control = self.hw.flow_control;
+                }
                 amigaos4::serial_println!("rsnet: interface {}: moderation {:?} us, flow control {:?}", self.slot, self.hw.moderation, self.hw.flow_control);
                 true
             }
@@ -948,9 +1045,10 @@ impl Link {
             // Its frames into the queue; not posted again (closed).
             self.take_batch(k);
         }
-        let result = match self.configure(false, Some(mtu), None, None) {
+        let result = match self.configure(false, Some(mtu), None, None, None) {
             Ok(()) => {
                 let got = self.device_mtu().unwrap_or(mtu);
+                self.mine.mtu = Some(got);
                 if (576..=s2xlogic::MTU_MAX).contains(&got) {
                     self.mtu = got;
                     self.hw_mtu = got;
@@ -1464,6 +1562,7 @@ impl Drop for Link {
             }
             b.in_flight = false;
         }
+        self.restore_settings();
         for b in self.rx_batches.iter().chain(self.tx_batch.iter()) {
             b.delete();
         }

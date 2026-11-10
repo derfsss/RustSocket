@@ -38,7 +38,8 @@ from Roadshow on purpose.
 - The unofficial SANA-II extensions (sana2ext, version 1), with a driver
   that offers them: frames read and written in batches, checksums
   checked and computed by the card, large TCP sends cut into segments by
-  the card. Any other driver is used through plain SANA-II.
+  the card, jumbo frames, interrupt moderation, flow control and several
+  receive queues. Any other driver is used through plain SANA-II.
 
 ## Speed
 

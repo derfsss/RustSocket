@@ -96,6 +96,8 @@ additions of rustsocket's own:
 | tcp.sendspace.max | 64 KB | the size the send buffer may grow to, in the same way, on paths with a round trip of 2 ms or more. The default (equal to tcp.sendspace) means no growth: internet uploads measured from an X5000 were no faster with a larger ceiling |
 | if.moderation.rx, if.moderation.tx | -1 | interrupt moderation, in microseconds between interrupts (0: off), for receive and send, on every interface whose driver can set it (SANA-II extensions, below); -1 leaves the driver's own. A driver that cannot set send apart uses the receive value for both |
 | if.flowcontrol | -1 | Ethernet flow control (pause frames) on those interfaces: 1 receive, 2 send, 4 negotiated, added together; 0 off; -1 leaves the driver's own |
+| if.txcsum | 3 | the send checksums left to the card of such a driver: 1 the IPv4 header, 2 TCP, added together; 0 none. Read when an interface is added; TCP segmentation needs both |
+| if.rss.queues | 1 | receive queues (receive-side scaling) asked of such a driver when an interface is added; 1 is none. One stack task serves every queue |
 
 ## SANA-II extensions
 
@@ -120,7 +122,14 @@ and plain SANA-II otherwise:
   DEVS:NetInterfaces, ConfigureNetInterface MTU) changes the driver's MTU,
   within what it allows (jumbo frames). Roadshow, like rustsocket with
   any other driver, only lowers it;
-- interrupt moderation and flow control from the if.* options above.
+- interrupt moderation and flow control from the if.* options above;
+- receive-side scaling: several receive queues (if.rss.queues), each with
+  its own reads.
+
+Settings belong to the network unit, so they outlast the interface: when
+an interface goes, rustsocket puts back every setting it changed (MTU,
+moderation, flow control, receive queues) to the value it read when the
+interface was added, unless something else has changed it since.
 
 ## Roadshow's tools on rustsocket
 

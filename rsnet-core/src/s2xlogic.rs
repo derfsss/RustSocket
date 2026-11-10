@@ -460,6 +460,52 @@ pub struct HwSettings {
     pub moderation: Option<(u32, u32)>,
     /// S2XFC_ modes (0: off).
     pub flow_control: Option<u32>,
+    /// RSS receive queues (1: off).
+    pub rss_queues: Option<u16>,
+}
+
+/// What to put back when a link closes: each setting the link changed
+/// (`mine`: the value it set) to the value it read at open (`opened`),
+/// but only while the unit still has the link's value (`now`, read again
+/// at close): a setting someone else changed since is left alone.
+pub fn restore_plan(opened: &HwSettings, mine: &HwSettings, now: &HwSettings) -> HwSettings {
+    fn pick<T: PartialEq + Copy>(o: Option<T>, m: Option<T>, n: Option<T>) -> Option<T> {
+        match (o, m, n) {
+            (Some(o), Some(m), Some(n)) if n == m && o != m => Some(o),
+            _ => None,
+        }
+    }
+    HwSettings {
+        mtu: pick(opened.mtu, mine.mtu, now.mtu),
+        moderation: pick(opened.moderation, mine.moderation, now.moderation),
+        flow_control: pick(opened.flow_control, mine.flow_control, now.flow_control),
+        rss_queues: pick(opened.rss_queues, mine.rss_queues, now.rss_queues),
+    }
+}
+
+/// The most RSS receive queues the stack asks for.
+pub const RSS_QUEUES_MAX: u16 = 8;
+
+/// The S2XSET_RSS the stack sends for the option if.rss.queues `want`
+/// (1 or less: none): (receive queues, hash types), the queues cut to the
+/// driver's and RSS_QUEUES_MAX, the hash types those of IPv4 the driver
+/// has. None without batches, without RSS, or with nothing to hash.
+pub fn rss_plan(c: &Caps, want: i32) -> Option<(u16, u32)> {
+    if want <= 1 || !c.batches() || c.rss_queues < 2 {
+        return None;
+    }
+    let q = (want.min(RSS_QUEUES_MAX as i32) as u16).min(c.rss_queues);
+    let hash = c.rss_hash & (S2XRSS_IPV4 | S2XRSS_TCPV4 | S2XRSS_UDPV4);
+    if q < 2 || hash == 0 {
+        return None;
+    }
+    Some((q, hash))
+}
+
+/// The frames to post on each of `queues` queues for `want` frames of a
+/// packet type in all (at least one each).
+pub fn per_queue(want: usize, queues: u16) -> usize {
+    want.div_ceil(queues.max(1) as usize).max(1)
 }
 
 /// What an IFA_LimitMTU / IFC_LimitMTU value asks of a link whose driver
@@ -826,6 +872,38 @@ mod tests {
         assert_eq!(flow_control_change(&c, 7, Some(0)), Some(S2XFC_RX | S2XFC_TX), "auto not offered");
         assert_eq!(flow_control_change(&c, 3, Some(3)), None);
         assert_eq!(flow_control_change(&Caps { flow_control: false, ..c }, 3, None), None);
+    }
+
+    #[test]
+    fn restore_at_close() {
+        let opened = HwSettings { mtu: Some(1500), moderation: Some((49, 49)), flow_control: Some(7), rss_queues: Some(1) };
+        let mine = HwSettings { mtu: Some(9000), moderation: Some((100, 100)), flow_control: None, rss_queues: Some(4) };
+        let now = HwSettings { mtu: Some(9000), moderation: Some((20, 20)), flow_control: Some(0), rss_queues: Some(4) };
+        let r = restore_plan(&opened, &mine, &now);
+        assert_eq!(r.mtu, Some(1500), "ours, unchanged since: put back");
+        assert_eq!(r.moderation, None, "changed by someone else since: left");
+        assert_eq!(r.flow_control, None, "never changed by the link");
+        assert_eq!(r.rss_queues, Some(1));
+        let same = HwSettings { mtu: Some(1500), ..mine };
+        assert_eq!(restore_plan(&opened, &same, &HwSettings { mtu: Some(1500), ..now }).mtu, None, "set to what it was: nothing to do");
+        assert_eq!(restore_plan(&opened, &mine, &HwSettings { mtu: None, ..now }).mtu, None, "not readable at close");
+    }
+
+    #[test]
+    fn rss_plans() {
+        let c = Caps { present: true, version: 1, batch_frames: 64, rss_hash: S2XRSS_IPV4 | S2XRSS_TCPV4 | S2XRSS_TCPV6, rss_queues: 4, ..Caps::default() };
+        assert_eq!(rss_plan(&c, 1), None, "the default: off");
+        assert_eq!(rss_plan(&c, -1), None);
+        assert_eq!(rss_plan(&c, 2), Some((2, S2XRSS_IPV4 | S2XRSS_TCPV4)), "IPv4 hash types only");
+        assert_eq!(rss_plan(&c, 16), Some((4, S2XRSS_IPV4 | S2XRSS_TCPV4)), "cut to the driver's");
+        assert_eq!(rss_plan(&Caps { rss_queues: 16, ..c }, 16), Some((RSS_QUEUES_MAX, S2XRSS_IPV4 | S2XRSS_TCPV4)));
+        assert_eq!(rss_plan(&Caps { batch_frames: 0, ..c }, 4), None);
+        assert_eq!(rss_plan(&Caps { rss_hash: S2XRSS_TCPV6, ..c }, 4), None, "nothing IPv4 to hash");
+        assert_eq!(rss_plan(&Caps { rss_queues: 1, ..c }, 4), None);
+        assert_eq!(per_queue(128, 4), 32);
+        assert_eq!(per_queue(8, 3), 3);
+        assert_eq!(per_queue(8, 16), 1);
+        assert_eq!(per_queue(128, 0), 128);
     }
 
     #[test]

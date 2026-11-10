@@ -95,9 +95,16 @@ pub static OPTIONS: [Opt; N_OPTIONS] = [
     opt("if.moderation.rx", -1, Rule::Range(-1, 1_000_000)),
     opt("if.moderation.tx", -1, Rule::Range(-1, 1_000_000)),
     opt("if.flowcontrol", -1, Rule::Range(-1, 7)),
+    // The checksums such a driver's card fills on send: 1 the IPv4
+    // header, 2 TCP, added together; 0 none (smoltcp computes them). Read
+    // when an interface is added.
+    opt("if.txcsum", 3, Rule::Range(0, 3)),
+    // Receive queues (receive-side scaling) asked of such a driver when
+    // an interface is added; 1 is none. One stack task serves them all.
+    opt("if.rss.queues", 1, Rule::Range(1, 8)),
 ];
 
-const N_OPTIONS: usize = 28;
+const N_OPTIONS: usize = 30;
 
 /// Bumped by every change of an option, so the stack can tell when to look
 /// at those it hands to drivers.
