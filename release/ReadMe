@@ -11,9 +11,10 @@ ping, tcpdump, the superserver and your network programs (PPC and 68k)
 keep working as before, now on rustsocket. Putting Roadshow's file back
 returns everything to Roadshow.
 
-Tested so far: an AmigaOne X5000 (p50x0_eth.device, gigabit Ethernet) and
-QEMU's AmigaOne machine (virtionet.device). This is a beta: please report
-what works and what does not, on any machine.
+Tested so far: an AmigaOne X5000 (its on-board p50x0_eth.device, and an
+Intel I210 card with igb.device, both gigabit Ethernet) and QEMU's
+AmigaOne machine (virtionet.device). This is a beta: please report what
+works and what does not, on any machine.
 
 
 1. What you need
@@ -61,12 +62,40 @@ Where it differs:
   means no growth. You can raise it with
       RoadshowControl SET tcp.sendspace.max=1048576
   but this has not been shown to make uploads faster.
+- Four options of rustsocket's own set up network cards whose driver
+  has the SANA-II extensions (next section): if.txcsum, if.rss.queues,
+  if.moderation.rx / if.moderation.tx and if.flowcontrol.
 
-The other options, and the few that rustsocket cannot change (for example
-udp.cksum, which is always on), are listed in the compatibility notes.
+Every option, and the few that rustsocket cannot change (for example
+udp.cksum, which is always on), are listed in docs/settings.md in the
+source repository.
 
 
-5. Known differences from Roadshow
+5. Faster network cards: the SANA-II extensions
+-----------------------------------------------
+Some drivers offer the unofficial SANA-II extensions: igb.device (Intel
+I210, I211, I350 and 82576 cards) does. With such a driver rustsocket
+reads and writes many frames at once and lets the card check and fill in
+checksums and cut large TCP sends into packets. On an X5000 with an I210
+this raised receive from 69 to about 95 MB/s, and sending uses about a
+fifth less CPU. There is nothing to set up: rustsocket finds them by
+itself. Every other driver works as before.
+
+The debug output shows a line "SANA-II extensions version 1 ..." when an
+interface is added whose driver has them.
+
+If you suspect them in a problem, turn off the parts that change what is
+sent:
+
+    RoadshowControl SET if.txcsum=0
+
+then remove and add the interface again (RemoveNetInterface and
+AddNetInterface). RoadshowControl SET lasts until the next reboot; to
+keep it, put 0 in the file ENVARC:Roadshow/if/txcsum. The details are in
+docs/sana2-extensions.md in the source repository.
+
+
+6. Known differences from Roadshow
 ----------------------------------
 - RemoveNetInterface removes any interface that no connection uses.
   Roadshow refuses ("Device busy") once an interface has been configured.
@@ -81,7 +110,7 @@ The full list, call by call and tool by tool, is in roadshow-compat.md in
 the source repository.
 
 
-6. If something goes wrong
+7. If something goes wrong
 --------------------------
 rustsocket writes what it does to the debug output, in lines that start
 with "rustsocket.library" or "rsnet". After a problem, before rebooting:
@@ -99,7 +128,7 @@ Please report:
     "rustsocket.library" or "rsnet".
 
 
-7. Licence
+8. Licence
 ----------
 rustsocket.library is under the MIT licence. It includes smoltcp
 (https://github.com/smoltcp-rs/smoltcp), under the 0BSD licence.

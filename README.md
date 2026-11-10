@@ -34,27 +34,35 @@ from Roadshow on purpose.
   the TCP: handler, and the "TCP/IP Control" port NetShutdown uses.
 - A 68k jump table, so 68k programs run on it too.
 - Receive and send buffers that size themselves to the connection
-  (see Settings in docs/roadshow-compat.md).
+  (see [docs/settings.md](docs/settings.md)).
 - The unofficial SANA-II extensions (sana2ext, version 1), with a driver
-  that offers them: frames read and written in batches, checksums
-  checked and computed by the card, large TCP sends cut into segments by
-  the card, jumbo frames, interrupt moderation, flow control and several
-  receive queues. Any other driver is used through plain SANA-II.
+  that offers them (such as [igb.device](https://github.com/derfsss/igb)
+  for Intel I210/I350 cards): frames read and written in batches,
+  checksums checked and computed by the card, large TCP sends cut into
+  segments by the card, jumbo frames, interrupt moderation, flow control
+  and several receive queues. Any other driver is used through plain
+  SANA-II. See [docs/sana2-extensions.md](docs/sana2-extensions.md).
 
 ## Speed
 
-AmigaOne X5000 (P5020, 2 GHz), p50x0_eth.device on gigabit Ethernet,
-against a PC, both stacks measured on the same day with netprof (every byte
-checked):
+AmigaOne X5000 (P5020, 2 GHz) on gigabit Ethernet to a PC, measured with
+netprof (256 MB each way, every byte checked), each stack with its default
+settings, all on the same day:
 
-| | Roadshow 1.15 | rustsocket |
-|---|---|---|
-| receive | 86-89 MB/s, ~82% CPU | ~80 MB/s, ~90% CPU |
-| send, each stack's default buffer | 89 MB/s (32 KB) | 115 MB/s (64 KB, line rate) |
-| send, both at 64 KB | 115 MB/s, 86-91% CPU | 115 MB/s, ~99% CPU |
+| Card and driver | | Roadshow 1.15 | rustsocket |
+|---|---|---|---|
+| Intel I210, igb.device (with the SANA-II extensions) | receive | 100-101 MB/s, 93% CPU | 94-96 MB/s, 96-98% CPU |
+| | send | 85 MB/s, 67-71% CPU | 100-106 MB/s, 75-84% CPU |
+| On-board, p50x0_eth.device (plain SANA-II) | receive | not measured that day | 67.5 MB/s |
+| | send | not measured that day | 100.6 MB/s, 96% CPU |
 
-Receive costs more CPU per byte than Roadshow's; that is the main
-open work.
+- Roadshow sends with a 32 KB buffer by default, rustsocket with 64 KB;
+  that is most of the send difference.
+- Roadshow still receives a little faster, with less CPU. Receive cost per
+  frame is the main open work.
+- With the I210, the SANA-II extensions take rustsocket's receive from
+  69 to 94-96 MB/s and cut the CPU used for sending by about 20 points
+  (details in [docs/sana2-extensions.md](docs/sana2-extensions.md)).
 
 ## Layout
 
@@ -63,6 +71,8 @@ open work.
 | `rsnet-core/` | the stack: the SANA-II link, smoltcp on it, the stack process, sockets, routes, DNS, the IP filter, NAT, bpf, statistics |
 | `rustsocket/` | the shared library: the bsdsocket.library interface (PPC and 68k), its glue, the superserver, the TCP: handler |
 | `docs/roadshow-compat.md` | compatibility with Roadshow, item by item |
+| `docs/settings.md` | every setting (RoadshowControl options), Roadshow's and rustsocket's own |
+| `docs/sana2-extensions.md` | the SANA-II extensions: what they do for users, and what rustsocket asks of a driver |
 | `release/ReadMe` | the end-user ReadMe that goes into the release archive |
 | `testprogs/` | AmigaOS test programs: `rstcp` (the library's checks, with C probes in `rstcp/c/`), `netprof` (network profiler), `rsnet` and `rsprobe` (the stack core and the library's openers) |
 | `tools/` | `build-package.sh`, `build-all.sh`, `netprof-host` (netprof's peer on a PC), the generators of the PPC and 68k jump tables, small host-side servers the tests use |

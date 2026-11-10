@@ -33,7 +33,7 @@ yet: ENOSYS").
 | Routing sockets | socket(PF_ROUTE), RTM_GET/ADD/DELETE/CHANGE | done: routes and the ARP table (RTF_LLINFO, link-level gateways); answers carry rtm_pid of the writer. Not yet: messages copied to other routing sockets, RTM_MISS and RTM_REDIRECT announcements |
 | Interface ioctls | SIOCGIFCONF, SIOCGIF{ADDR,NETMASK,BRDADDR,FLAGS,METRIC,DSTADDR}, SIOCSIF{ADDR,NETMASK,FLAGS}, SIOCAIFADDR, SIOCDIFADDR, SIOCATMARK, process group, water marks | done, through the stack's interface configuration: one address per interface (an alias replaces it); SIOCGIFDSTADDR gives EINVAL (no point-to-point); SIOCADDMULTI/DELMULTI give EOPNOTSUPP (no multicast); SIOCGARP/SARP/DARP are not in this SDK (arp uses routing sockets) |
 | Socket options | SO_RCVTIMEO/SNDTIMEO, SO_KEEPALIVE, TCP_NODELAY, SO_LINGER, SO_EVENTMASK, flag options | done |
-| | SO_SNDBUF / SO_RCVBUF | partial: new sockets take tcp.recvspace/sendspace and udp.recvspace/sendspace (RoadshowControl), and getsockopt reports the real sizes; setsockopt does not resize a socket. Differs: tcp.sendspace defaults to 64 KB, not 32 KB (gigabit sends at line rate on an AmigaOne X5000 with it: 115 MB/s instead of 85), and TCP buffers are auto-tuned (see Settings) |
+| | SO_SNDBUF / SO_RCVBUF | partial: new sockets take tcp.recvspace/sendspace and udp.recvspace/sendspace (RoadshowControl), and getsockopt reports the real sizes; setsockopt does not resize a socket. Differs: tcp.sendspace defaults to 64 KB, not 32 KB (gigabit sends at line rate on an AmigaOne X5000 with it: 115 MB/s instead of 85), and TCP buffers are auto-tuned (see [settings.md](settings.md)) |
 | | IP_TTL, IP_TOS | partial: IP_TTL as above; IP_TOS accepted with no effect |
 | Descriptors | Dup2Socket, ReleaseSocket, ReleaseCopyOfSocket, ObtainSocket, getdtablesize, SetSocketSignals, GetSocketEvents | done |
 | Base tags | SocketBaseTagList, every SBTC code | done, see below |
@@ -48,7 +48,7 @@ yet: ENOSYS").
 | Interface API | AddInterfaceTagList, ConfigureInterfaceTagList, RemoveInterface, BeginInterfaceConfig, AbortInterfaceConfig, CreateAddrAllocMessageA, DeleteAddrAllocMessage | partial: interfaces are added, configured (address, mask, up/down, release, MTU, metric, broadcast address, aliases) and removed at run time; DHCP runs through the address allocation message, which the stack fills in and replies (address, mask, server, routers, DNS servers, host and domain names, lease expiry). Not yet: BOOTP and the link-local protocols (AAMR_Ignored), requesting a particular address, static routes from DHCP, point-to-point interfaces |
 | Routing API | AddRouteTagList, DeleteRouteTagList, ChangeRouteTagList, GetRouteInfo, FreeRouteInfo | done: one table, most specific match, gateways reached through the interface whose subnet holds them; EEXIST / ESRCH / EHOSTUNREACH; GetRouteInfo in Roadshow's rt_msghdr layout and order. Not yet: a destination with no gateway (point-to-point) |
 | DNS API | AddDomainNameServer, RemoveDomainNameServer, ObtainDomainNameServerList, ReleaseDomainNameServerList | done: static servers with use counts, DHCP's as dynamic, listed as Roadshow lists them (a server from DHCP that AddNetInterface also added shows twice, as on Roadshow). Differs: every interface's DHCP servers are used and listed, and they go when their interface is removed; Roadshow uses only the first DHCP interface's and keeps listing them after it is removed |
-| RoadshowData | ObtainRoadshowData, ReleaseRoadshowData, ChangeRoadshowData | done: Roadshow's 23 options plus two of rustsocket's own (see Settings). ip.defttl, ip.forwarding, ip.sendredirects, icmp.procesststamp, tcp/udp recvspace/sendspace and task.controller.priority take effect; options the stack cannot honour refuse other values (EINVAL); the rest are kept. One writer at a time (EBUSY), with exec semaphore rules as Roadshow's |
+| RoadshowData | ObtainRoadshowData, ReleaseRoadshowData, ChangeRoadshowData | done: Roadshow's 23 options plus rustsocket's own ([settings.md](settings.md)). ip.defttl, ip.forwarding, ip.sendredirects, icmp.procesststamp, tcp/udp recvspace/sendspace and task.controller.priority take effect; options the stack cannot honour refuse other values (EINVAL); the rest are kept. One writer at a time (EBUSY), with exec semaphore rules as Roadshow's |
 | Monitoring | AddNetMonitorHookTagList, RemoveNetMonitorHook | done: MHT_Connect/Bind/Send in the caller's task (a positive result fails the call with that errno), MHT_Packet/ICMP/UDP/TCP_Connect in the stack on each frame. MA_Ignore and MA_DropWithReset drop like MA_Drop (no reset is sent) |
 | Server API | ProcessIsServer, ObtainServerSocket | done: the superserver records each program it starts before the program runs; ObtainServerSocket hands the socket out once |
 | Kernel memory + IP filter hook | mbuf_* (11 calls), SBTC_IP_FILTER_HOOK, SBTC_IPF_API_VERSION | done: the hook sees every IPv4 datagram in (before the stack) and out, with IPFilterMsg as Roadshow's; it can drop or replace a datagram. mbufs follow the SDK's sys/mbuf.h and the 4.4BSD routines. Roadshow differs from its own autodoc in two calls (its mbuf_copym shares the data, its mbuf_cat leaves the chain as it was); rustsocket does what the autodoc says |
@@ -84,52 +84,19 @@ Every code in bsdsocket.h is handled, by value and by reference.
 
 ## Settings
 
-The stack-wide options are Roadshow's, read and changed with
-RoadshowControl, ChangeRoadshowData or ENV:Roadshow/<area>/<name>, with
-additions of rustsocket's own:
-
-| Option | Default | Meaning |
-|---|---|---|
-| tcp.recvspace | 64 KB | a TCP connection's receive buffer to start with |
-| tcp.recvspace.max | 1 MB | the size the receive buffer may grow to. Once per round trip the stack measures how fast the program reads and sizes the buffer to twice the data in flight; it shrinks back when the transfer slows down or the connection goes idle. On a LAN (round trip under 2 ms) it stops at 512 KB, which kept the data in the cache and was faster on an AmigaOne X5000 |
-| tcp.sendspace | 64 KB | a TCP connection's send buffer to start with (Roadshow: 32 KB) |
-| tcp.sendspace.max | 64 KB | the size the send buffer may grow to, in the same way, on paths with a round trip of 2 ms or more. The default (equal to tcp.sendspace) means no growth: internet uploads measured from an X5000 were no faster with a larger ceiling |
-| if.moderation.rx, if.moderation.tx | -1 | interrupt moderation, in microseconds between interrupts (0: off), for receive and send, on every interface whose driver can set it (SANA-II extensions, below); -1 leaves the driver's own. A driver that cannot set send apart uses the receive value for both |
-| if.flowcontrol | -1 | Ethernet flow control (pause frames) on those interfaces: 1 receive, 2 send, 4 negotiated, added together; 0 off; -1 leaves the driver's own |
-| if.txcsum | 3 | the send checksums left to the card of such a driver: 1 the IPv4 header, 2 TCP, added together; 0 none. Read when an interface is added; TCP segmentation needs both |
-| if.rss.queues | 1 | receive queues (receive-side scaling) asked of such a driver when an interface is added; 1 is none. One stack task serves every queue |
+rustsocket reads and changes Roadshow's options in the same ways
+(RoadshowControl, ChangeRoadshowData, ENV:Roadshow/<area>/<name>) and adds
+a few of its own. Every option, what it does and which ones rustsocket
+only stores: [settings.md](settings.md). Differs: tcp.sendspace defaults
+to 64 KB, not 32 KB.
 
 ## SANA-II extensions
 
-rustsocket uses the unofficial SANA-II extensions (sana2ext, version 1:
-docs/devices/sana2ext.md of the amigaos4 crate) when a driver offers them,
-and plain SANA-II otherwise:
-
-- frames read and written several per request (S2X_READBATCH,
-  S2X_WRITEBATCH);
-- receive checksums checked by the card are not checked again, and frames
-  the card found bad are dropped (counted as input errors). While the IP
-  filter runs or a filter hook is installed every frame is checked, since
-  those may change it;
-- the IPv4 header and TCP checksums of frames sent are computed by the
-  card. Monitoring hooks, bpf (tcpdump) and the filter hook see those
-  frames before the card has filled the fields in;
-- TCP sends larger than the MTU, cut into segments by the card
-  (S2XFRAME_SEGMENT), up to the largest frame it takes; the stack cuts a
-  send itself when it is past the card's limits. Monitoring hooks and bpf
-  see the large send as one frame;
-- MTU: an MTU larger than the driver's (the MTU option of
-  DEVS:NetInterfaces, ConfigureNetInterface MTU) changes the driver's MTU,
-  within what it allows (jumbo frames). Roadshow, like rustsocket with
-  any other driver, only lowers it;
-- interrupt moderation and flow control from the if.* options above;
-- receive-side scaling: several receive queues (if.rss.queues), each with
-  its own reads.
-
-Settings belong to the network unit, so they outlast the interface: when
-an interface goes, rustsocket puts back every setting it changed (MTU,
-moderation, flow control, receive queues) to the value it read when the
-interface was added, unless something else has changed it since.
+With a driver that offers the unofficial SANA-II extensions, rustsocket
+reads and writes frames in batches, leaves checksums and TCP segmentation
+to the card, and can change the card's MTU, interrupt moderation, flow
+control and receive queues. Roadshow uses such a driver through plain
+SANA-II. Details: [sana2-extensions.md](sana2-extensions.md).
 
 ## Roadshow's tools on rustsocket
 
