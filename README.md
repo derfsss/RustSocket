@@ -35,6 +35,9 @@ from Roadshow on purpose.
 - A 68k jump table, so 68k programs run on it too.
 - Receive and send buffers that size themselves to the connection
   (see Settings in docs/roadshow-compat.md).
+- The unofficial SANA-II extensions (sana2ext, version 1), with a driver
+  that offers them: frames read and written in batches, checksums
+  checked by the card. Any other driver is used through plain SANA-II.
 
 ## Speed
 
@@ -112,6 +115,8 @@ Roadshow's file back returns to Roadshow.
 - smoltcp's own unit tests, on the host:
   `cargo test --lib --features socket-tcp-reno` in
   `third_party/smoltcp-0.14.0`.
+- The stack's device-free logic (the SANA-II extensions' bookkeeping), on
+  the host: `cargo test` in `rsnet-core/host-tests`.
 
 ## Credits
 

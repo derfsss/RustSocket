@@ -92,7 +92,43 @@ impl InterfaceInner {
         })
     }
 
+    /// rustsocket patch: checks the card made on this frame
+    /// (`meta.rx_checked`) are not made again: the receive side of those
+    /// checksum capabilities is off while this frame is processed, the
+    /// send side unchanged (an answer is emitted after this returns, with
+    /// the capabilities restored).
     pub(super) fn process_ipv4<'a>(
+        &mut self,
+        sockets: &mut SocketSet,
+        meta: PacketMeta,
+        source_hardware_addr: HardwareAddress,
+        ipv4_packet: &Ipv4Packet<&'a [u8]>,
+        frag: &'a mut FragmentsBuffer,
+    ) -> Option<Packet<'a>> {
+        if meta.rx_checked == 0 {
+            return self.process_ipv4_checked(sockets, meta, source_hardware_addr, ipv4_packet, frag);
+        }
+        fn no_rx(c: &mut crate::phy::Checksum) {
+            use crate::phy::Checksum;
+            *c = match *c {
+                Checksum::Both | Checksum::Tx => Checksum::Tx,
+                Checksum::Rx | Checksum::None => Checksum::None,
+            };
+        }
+        let saved = self.caps.checksum.clone();
+        if meta.rx_checked & crate::phy::RX_CHECKED_IPV4 != 0 {
+            no_rx(&mut self.caps.checksum.ipv4);
+        }
+        if meta.rx_checked & crate::phy::RX_CHECKED_L4 != 0 {
+            no_rx(&mut self.caps.checksum.tcp);
+            no_rx(&mut self.caps.checksum.udp);
+        }
+        let r = self.process_ipv4_checked(sockets, meta, source_hardware_addr, ipv4_packet, frag);
+        self.caps.checksum = saved;
+        r
+    }
+
+    fn process_ipv4_checked<'a>(
         &mut self,
         sockets: &mut SocketSet,
         meta: PacketMeta,

@@ -1548,3 +1548,70 @@ fn test_ipv4_fragment_size() {
         );
     }
 }
+
+/// rustsocket patch: checks the card made (PacketMeta::rx_checked) are
+/// skipped for that frame alone; the others are still made.
+#[rstest]
+#[case(Medium::Ethernet)]
+#[cfg(all(feature = "socket-udp", feature = "medium-ethernet"))]
+fn test_rx_checked_skips_checksums(#[case] medium: Medium) {
+    use crate::phy::{RX_CHECKED_IPV4, RX_CHECKED_L4};
+    use crate::socket::udp;
+    use crate::wire::{UdpPacket, UdpRepr};
+
+    static PAYLOAD: [u8; 5] = [0x48, 0x65, 0x6c, 0x6c, 0x6f];
+    let (mut iface, mut sockets, _) = setup(medium);
+    let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 64]);
+    let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY], vec![0; 15]);
+    let h = sockets.add(udp::Socket::new(rx, tx));
+    assert_eq!(sockets.get_mut::<udp::Socket>(h).bind(68), Ok(()));
+
+    let src_addr = Ipv4Address::new(127, 0, 0, 2);
+    let dst_addr = Ipv4Address::new(127, 0, 0, 1);
+    let udp_repr = UdpRepr { src_port: 67, dst_port: 68 };
+    let ipv4_repr = Ipv4Repr {
+        src_addr,
+        dst_addr,
+        next_header: IpProtocol::Udp,
+        hop_limit: 64,
+        payload_len: udp_repr.header_len() + PAYLOAD.len(),
+    };
+    // bad_ip / bad_udp: that checksum is wrong.
+    let datagram = |bad_ip: bool, bad_udp: bool| {
+        let mut b = vec![0u8; ipv4_repr.buffer_len() + udp_repr.header_len() + PAYLOAD.len()];
+        ipv4_repr.emit(&mut Ipv4Packet::new_unchecked(&mut b), &ChecksumCapabilities::default());
+        udp_repr.emit(
+            &mut UdpPacket::new_unchecked(&mut b[ipv4_repr.buffer_len()..]),
+            &src_addr.into(),
+            &dst_addr.into(),
+            PAYLOAD.len(),
+            |buf| buf.copy_from_slice(&PAYLOAD),
+            &ChecksumCapabilities::default(),
+        );
+        if bad_ip {
+            b[10] ^= 0x5a;
+        }
+        if bad_udp {
+            b[ipv4_repr.buffer_len() + 6] ^= 0x5a;
+        }
+        b
+    };
+    let mut feed = |bytes: Vec<u8>, checked: u8| {
+        let mut meta = PacketMeta::default();
+        meta.rx_checked = checked;
+        let _ = iface.inner.process_ipv4(&mut sockets, meta, HardwareAddress::default(), &Ipv4Packet::new_unchecked(&bytes[..]), &mut iface.fragments);
+        let caps = &iface.inner.caps.checksum;
+        assert!(caps.ipv4.rx() && caps.udp.rx() && caps.tcp.rx(), "capabilities restored");
+        let s = sockets.get_mut::<udp::Socket>(h);
+        let got = s.can_recv();
+        while s.recv().is_ok() {}
+        got
+    };
+    assert!(feed(datagram(false, false), 0), "good, verified");
+    assert!(!feed(datagram(false, true), 0), "bad UDP sum dropped");
+    assert!(!feed(datagram(true, false), 0), "bad IP sum dropped");
+    assert!(feed(datagram(false, true), RX_CHECKED_L4), "UDP checked by the card");
+    assert!(feed(datagram(true, true), RX_CHECKED_IPV4 | RX_CHECKED_L4), "both checked by the card");
+    assert!(!feed(datagram(true, false), RX_CHECKED_L4), "IP header still verified");
+    assert!(!feed(datagram(false, true), RX_CHECKED_IPV4), "UDP still verified");
+}

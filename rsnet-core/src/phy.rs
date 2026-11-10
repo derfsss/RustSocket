@@ -1,14 +1,18 @@
 //! smoltcp's `Device` on a [`Link`]: received frames come from the link's
 //! queue (their buffers go back to its pool once read), transmitted ones are
 //! written straight into the link's write buffer and go out as raw writes.
+//! A received frame's checksum checks that the card made (SANA-II
+//! extensions) reach smoltcp as its PacketMeta (a patch of the vendored
+//! copy), which skips them for that frame.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use smoltcp::phy::{Device, DeviceCapabilities, Loopback, Medium, RxToken, TxToken};
+use smoltcp::phy::{Device, DeviceCapabilities, Loopback, Medium, PacketMeta, RxToken, TxToken};
 use smoltcp::time::Instant;
 
 use crate::link::{Buf, Link, Pool};
+use crate::s2xlogic;
 
 /// A received frame, and the pool its buffer returns to.
 pub struct Rx(Box<Buf>, Pool);
@@ -23,6 +27,18 @@ impl RxToken for Rx {
         let r = f(frame);
         self.1.give(self.0);
         r
+    }
+
+    /// The checks the card made on this frame: smoltcp skips them.
+    fn meta(&self) -> PacketMeta {
+        let mut m = PacketMeta::default();
+        if self.0.trust & s2xlogic::TRUST_IP != 0 {
+            m.rx_checked |= smoltcp::phy::RX_CHECKED_IPV4;
+        }
+        if self.0.trust & s2xlogic::TRUST_L4 != 0 {
+            m.rx_checked |= smoltcp::phy::RX_CHECKED_L4;
+        }
+        m
     }
 }
 
@@ -132,6 +148,11 @@ impl Device for Link {
                 if let Some(n) = kept {
                     let (_, len) = f.parts();
                     *len = n as u32;
+                    // NAT and a filter hook may have changed the frame
+                    // since the card checked it: smoltcp checks it again.
+                    if f.trust != 0 && (crate::ipfil::running() || crate::ipf::hook() != 0) {
+                        f.trust = 0;
+                    }
                     // A time stamp request: answered here (smoltcp does
                     // not), while icmp.procesststamp says so (forward.rs).
                     let ts = if crate::settings::SETTINGS.get(crate::settings::Setting::IcmpProcessTstamp) == crate::settings::IR_PROCESS {
@@ -147,6 +168,9 @@ impl Device for Link {
                     } else if !self.to_forward(f.frame()) {
                         // For another host, while forwarding: to the stack
                         // process, not smoltcp (forward.rs).
+                        if f.trust != 0 {
+                            self.stats.rx_csum_ok += 1;
+                        }
                         break f;
                     } else {
                         let copy = f.frame().to_vec();

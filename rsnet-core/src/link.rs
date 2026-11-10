@@ -652,9 +652,6 @@ impl Link {
                 }
                 RxCsum::Trust(t) => {
                     full.trust = t;
-                    if t != 0 {
-                        self.stats.rx_csum_ok += 1;
-                    }
                 }
             }
             self.rx.push_back(full);

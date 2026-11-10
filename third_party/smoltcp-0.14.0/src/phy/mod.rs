@@ -181,7 +181,20 @@ pub struct PacketMeta {
     /// If `None`, no segmentation will be performed by the device.
     #[cfg(feature = "segmentation-offload")]
     pub segmentation_offload_size: Option<NonZeroU16>,
+
+    /// rustsocket patch: checks the network card already made on this
+    /// received frame, which the interface then skips for it alone
+    /// ([`RX_CHECKED_IPV4`], [`RX_CHECKED_L4`]); 0: verify as the
+    /// device's checksum capabilities say.
+    pub rx_checked: u8,
 }
+
+/// rustsocket patch: [`PacketMeta::rx_checked`]: the IPv4 header checksum
+/// was checked and is good.
+pub const RX_CHECKED_IPV4: u8 = 1;
+/// rustsocket patch: [`PacketMeta::rx_checked`]: the TCP or UDP checksum
+/// was checked and is good.
+pub const RX_CHECKED_L4: u8 = 2;
 
 /// A description of checksum behavior for a particular protocol.
 #[derive(Debug, Clone, Copy, Default)]
