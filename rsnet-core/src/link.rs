@@ -445,6 +445,8 @@ pub struct LinkStats {
     /// Frames the link keeps posted for reading (plain reads, or the
     /// frames of its read batches).
     pub reads_posted: u32,
+    /// The most frames one write carries (a write batch's frames; 0: one).
+    pub writes_max: u32,
     /// Read batches that came back and the frames they carried (frames
     /// per batch: the one divided by the other); the same for writes.
     pub rx_batches: u32,
@@ -585,6 +587,7 @@ impl Link {
             }
         }
         link.stats.reads_posted = link.reads.len() as u32 + link.rx_batches.iter().map(|b| b.slots.len() as u32).sum::<u32>();
+        link.stats.writes_max = link.tx_batch.as_ref().map(|b| b.slots.len() as u32).unwrap_or(1);
         Ok(link)
     }
 
@@ -985,6 +988,7 @@ impl Link {
                 if o.give_up {
                     amigaos4::serial_println!("rsnet: S2X_WRITEBATCH refused (io_Error {}): plain writes", err);
                     self.tx_batch_on = false;
+                    self.stats.writes_max = 1;
                 }
                 // flush() writes what is left one by one.
                 return;
