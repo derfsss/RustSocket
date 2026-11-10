@@ -367,7 +367,11 @@ impl<'a> Socket<'a> {
 
         match self.rx_buffer.enqueue(total_len, ()) {
             Ok(buf) => {
-                ip_repr.emit(&mut buf[..header_len], &cx.checksum_caps());
+                // rustsocket patch: the header handed to the program has its
+                // checksum, also when the device computes send checksums
+                // (which would leave it 0 here).
+                let _ = cx;
+                ip_repr.emit(&mut buf[..header_len], &crate::phy::ChecksumCapabilities::default());
                 buf[header_len..].copy_from_slice(payload);
             }
             Err(_) => net_trace!(
@@ -412,7 +416,11 @@ impl<'a> Socket<'a> {
                     }
 
                     let packet = Ipv4Packet::new_unchecked(&*packet.into_inner());
-                    let ipv4_repr = match Ipv4Repr::parse(&packet, _checksum_caps) {
+                    // rustsocket patch: not verified: the checksum was just
+                    // filled or, when the device computes it, left 0, which
+                    // the check would refuse (every raw IPv4 send dropped
+                    // with send checksum offload).
+                    let ipv4_repr = match Ipv4Repr::parse(&packet, &crate::phy::ChecksumCapabilities::ignored()) {
                         Ok(x) => x,
                         Err(_) => {
                             net_trace!("raw: malformed ipv4 packet in queue, dropping.");
