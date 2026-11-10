@@ -8,7 +8,8 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use smoltcp::phy::{Device, DeviceCapabilities, Loopback, Medium, PacketMeta, RxToken, TxToken};
+use amigaos4::sana2ext::{S2XCSUM_IPV4, S2XCSUM_TCPV4};
+use smoltcp::phy::{Checksum, Device, DeviceCapabilities, Loopback, Medium, PacketMeta, RxToken, TxToken};
 use smoltcp::time::Instant;
 
 use crate::link::{Buf, Link, Pool};
@@ -51,7 +52,7 @@ impl TxToken for Tx<'_> {
         F: FnOnce(&mut [u8]) -> R,
     {
         self.0
-            .send_with(len, |b| {
+            .send_stack(len, |b| {
                 let r = f(b);
                 crate::stats::frame(b, false);
                 r
@@ -194,6 +195,15 @@ impl Device for Link {
         // smoltcp counts the Ethernet header in the MTU of this medium.
         c.max_transmission_unit = self.mtu as usize + 14;
         c.max_burst_size = None;
+        // Checksums the card computes on send (SANA-II extensions):
+        // smoltcp leaves them 0 and the link readies them for the card.
+        // Receive checks are still made (or skipped per frame: Rx::meta).
+        if self.tx_offload & S2XCSUM_IPV4 != 0 {
+            c.checksum.ipv4 = Checksum::Rx;
+        }
+        if self.tx_offload & S2XCSUM_TCPV4 != 0 {
+            c.checksum.tcp = Checksum::Rx;
+        }
         c
     }
 }

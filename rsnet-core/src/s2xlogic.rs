@@ -218,6 +218,108 @@ pub fn rx_csum(flags: u32, protocols: u32, frame: &[u8]) -> RxCsum {
     RxCsum::Trust(t)
 }
 
+/// The checksums the stack leaves to the card on send, from the driver's
+/// transmit protocols: the IPv4 header and TCP over IPv4. UDP is not
+/// among them: smoltcp fragments a large datagram itself, and the card
+/// cannot sum a datagram over its fragments.
+pub fn tx_offload(c: &Caps) -> u32 {
+    if !c.batches() {
+        return 0;
+    }
+    c.tx_csum & (S2XCSUM_IPV4 | S2XCSUM_TCPV4)
+}
+
+/// What the card is asked to fill in one frame (an S2XFRAME_CHECKSUM
+/// item on send): S2XCS_FILL_ bits (0: nothing), and for FILL_L4 where the
+/// sum starts and where the result goes (from Start), counted from the
+/// first byte of the frame as copied (the Ethernet header: raw writes).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TxFill {
+    pub flags: u32,
+    pub start: u16,
+    pub offset: u16,
+}
+
+/// The 16-bit ones' complement sum of `data` added to `sum`, folded.
+fn sum16(mut sum: u32, data: &[u8]) -> u32 {
+    let mut c = data.chunks_exact(2);
+    for w in &mut c {
+        sum += u16::from_be_bytes([w[0], w[1]]) as u32;
+    }
+    if let [b] = c.remainder() {
+        sum += (*b as u32) << 8;
+    }
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    sum
+}
+
+/// The IPv4 pseudo-header's sum (addresses, protocol, `len`), folded,
+/// not complemented: what goes in the checksum field for the card.
+pub fn pseudo_sum(src: [u8; 4], dst: [u8; 4], proto: u8, len: u16) -> u16 {
+    let s = sum16(0, &src);
+    let s = sum16(s, &dst);
+    sum16(s + proto as u32 + len as u32, &[]) as u16
+}
+
+/// Ready an Ethernet `frame` the stack built (its offloaded checksums
+/// left 0) for the card: the IPv4 header's sum field 0 for FILL_IP; for
+/// TCP over IPv4 (not a fragment, nothing after the datagram) the
+/// pseudo-header sum in the TCP checksum field for FILL_L4. Runs after
+/// the IP filter and NAT, which may change addresses and ports: what the
+/// card sums is the frame as it goes out. `offload`: tx_offload's bits.
+pub fn tx_plan(frame: &mut [u8], offload: u32) -> TxFill {
+    let mut f = TxFill::default();
+    if offload == 0 || frame.len() < 34 || frame[12] != 0x08 || frame[13] != 0x00 {
+        return f;
+    }
+    let ihl = ((frame[14] & 0x0f) as usize) * 4;
+    if frame[14] >> 4 != 4 || ihl < 20 || frame.len() < 14 + ihl {
+        return f;
+    }
+    if offload & S2XCSUM_IPV4 != 0 {
+        frame[24] = 0;
+        frame[25] = 0;
+        f.flags |= S2XCS_FILL_IP;
+    }
+    let total = u16::from_be_bytes([frame[16], frame[17]]) as usize;
+    let fragment = u16::from_be_bytes([frame[20], frame[21]]) & 0x3fff != 0;
+    if offload & S2XCSUM_TCPV4 != 0 && frame[23] == 6 && !fragment && total >= ihl + 20 && 14 + total == frame.len() {
+        let start = 14 + ihl;
+        let len = (total - ihl) as u16;
+        let src = [frame[26], frame[27], frame[28], frame[29]];
+        let dst = [frame[30], frame[31], frame[32], frame[33]];
+        frame[start + 16..start + 18].copy_from_slice(&pseudo_sum(src, dst, 6, len).to_be_bytes());
+        f.flags |= S2XCS_FILL_L4;
+        f.start = start as u16;
+        f.offset = 16;
+    }
+    f
+}
+
+/// Do what `fill` asked of the card, in software: for a frame that goes
+/// out as a plain CMD_WRITE after all (the driver turned a batch down).
+pub fn tx_software(frame: &mut [u8], fill: TxFill) {
+    if fill.flags & S2XCS_FILL_IP != 0 && frame.len() >= 34 {
+        let ihl = (((frame[14] & 0x0f) as usize) * 4).clamp(20, frame.len() - 14);
+        frame[24] = 0;
+        frame[25] = 0;
+        let s = !(sum16(0, &frame[14..14 + ihl]) as u16);
+        frame[24..26].copy_from_slice(&s.to_be_bytes());
+    }
+    let (start, at) = (fill.start as usize, fill.start as usize + fill.offset as usize);
+    if fill.flags & S2XCS_FILL_L4 != 0 && at + 2 <= frame.len() {
+        // The field holds the pseudo-header sum: summing from Start to the
+        // end takes it in, as the card does.
+        let mut s = !(sum16(0, &frame[start..]) as u16);
+        if s == 0 && frame.get(23) == Some(&17) {
+            s = 0xffff;
+        }
+        frame[at..at + 2].copy_from_slice(&s.to_be_bytes());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,6 +417,118 @@ mod tests {
         assert_eq!(read_outcome(16, 0, S2ERR_NOT_SUPPORTED), (0, ReadNext::Fallback));
         assert_eq!(read_outcome(16, 2, IOERR_NOCMD), (2, ReadNext::Repost { error: true }));
         assert_eq!(read_outcome(16, 0, 10), (0, ReadNext::Repost { error: true }));
+    }
+
+    /// An Ethernet + IPv4 + TCP frame with `payload` bytes and correct
+    /// checksums, summed the plain way (an independent reference).
+    fn tcp_frame(payload: usize, frag: u16) -> Vec<u8> {
+        tcp_frame_from(payload, frag, [192, 168, 0, 26])
+    }
+
+    fn tcp_frame_from(payload: usize, frag: u16, src: [u8; 4]) -> Vec<u8> {
+        let total = 20 + 20 + payload;
+        let mut f = alloc::vec![0u8; 14 + total];
+        f[12] = 0x08;
+        f[14] = 0x45;
+        f[16..18].copy_from_slice(&(total as u16).to_be_bytes());
+        f[18..20].copy_from_slice(&0x1234u16.to_be_bytes());
+        f[20..22].copy_from_slice(&frag.to_be_bytes());
+        f[22] = 64;
+        f[23] = 6;
+        f[26..30].copy_from_slice(&src);
+        f[30..34].copy_from_slice(&[192, 168, 0, 156]);
+        let t = 34;
+        f[t..t + 2].copy_from_slice(&4620u16.to_be_bytes());
+        f[t + 2..t + 4].copy_from_slice(&80u16.to_be_bytes());
+        f[t + 4..t + 8].copy_from_slice(&0xdeadbeefu32.to_be_bytes());
+        f[t + 12] = 0x50;
+        f[t + 13] = 0x18;
+        f[t + 14..t + 16].copy_from_slice(&0xffffu16.to_be_bytes());
+        for (i, b) in f[t + 20..].iter_mut().enumerate() {
+            *b = (i * 7 + 3) as u8;
+        }
+        // Reference sums: word by word, carries folded at the end.
+        let words = |d: &[u8]| -> u32 { d.chunks(2).map(|w| ((w[0] as u32) << 8) | *w.get(1).unwrap_or(&0) as u32).sum() };
+        let fold = |mut s: u32| {
+            while s >> 16 != 0 {
+                s = (s & 0xffff) + (s >> 16);
+            }
+            !(s as u16)
+        };
+        let ip = fold(words(&f[14..34]));
+        f[24..26].copy_from_slice(&ip.to_be_bytes());
+        let mut ph = Vec::new();
+        ph.extend_from_slice(&f[26..34]);
+        ph.extend_from_slice(&[0, 6]);
+        ph.extend_from_slice(&((total - 20) as u16).to_be_bytes());
+        let tcp = fold(words(&ph) + words(&f[t..]));
+        f[t + 16..t + 18].copy_from_slice(&tcp.to_be_bytes());
+        f
+    }
+
+    /// What the card does with an S2XFRAME_CHECKSUM item (virtio-net's
+    /// model), for the tests: the same as tx_software.
+    fn card(frame: &mut [u8], fill: TxFill) {
+        tx_software(frame, fill);
+    }
+
+    #[test]
+    fn tx_checksum_offload() {
+        for payload in [0usize, 1, 2, 3, 1460] {
+            let good = tcp_frame(payload, 0x4000);
+            let mut f = good.clone();
+            // As smoltcp leaves it with the sums off: both fields 0.
+            f[24..26].fill(0);
+            f[50..52].fill(0);
+            let fill = tx_plan(&mut f, S2XCSUM_IPV4 | S2XCSUM_TCPV4);
+            assert_eq!(fill, TxFill { flags: S2XCS_FILL_IP | S2XCS_FILL_L4, start: 34, offset: 16 });
+            let ph = pseudo_sum([192, 168, 0, 26], [192, 168, 0, 156], 6, (20 + payload) as u16);
+            assert_eq!(u16::from_be_bytes([f[50], f[51]]), ph, "pseudo-header sum in the field");
+            card(&mut f, fill);
+            assert_eq!(f, good, "payload {}", payload);
+        }
+    }
+
+
+    #[test]
+    fn tx_checksum_after_nat() {
+        // NAT rewrote the source address after smoltcp built the frame and
+        // adjusted the zero fields incrementally (garbage now): the plan
+        // sums the frame as it goes out.
+        let good = tcp_frame_from(100, 0, [10, 0, 0, 1]);
+        let mut f = good.clone();
+        f[24..26].copy_from_slice(&[0x12, 0x34]);
+        f[50..52].copy_from_slice(&[0x56, 0x78]);
+        let fill = tx_plan(&mut f, S2XCSUM_IPV4 | S2XCSUM_TCPV4);
+        card(&mut f, fill);
+        assert_eq!(f, good);
+    }
+
+    #[test]
+    fn tx_checksum_not_offloaded() {
+        let mut f = tcp_frame(10, 0);
+        let keep = f.clone();
+        assert_eq!(tx_plan(&mut f, 0), TxFill::default());
+        assert_eq!(tx_plan(&mut f, S2XCSUM_UDPV4), TxFill::default(), "UDP only: nothing for TCP");
+        assert_eq!(f, keep);
+        let mut frag = tcp_frame(10, 0x2000);
+        assert_eq!(tx_plan(&mut frag, S2XCSUM_IPV4 | S2XCSUM_TCPV4).flags, S2XCS_FILL_IP, "fragment: header only");
+        let mut padded = tcp_frame(0, 0);
+        padded.extend_from_slice(&[0; 6]);
+        assert_eq!(tx_plan(&mut padded, S2XCSUM_IPV4 | S2XCSUM_TCPV4).flags, S2XCS_FILL_IP, "padding after the datagram");
+        let mut only_tcp = tcp_frame(10, 0);
+        let fill = tx_plan(&mut only_tcp, S2XCSUM_TCPV4);
+        assert_eq!(fill.flags, S2XCS_FILL_L4);
+        assert_eq!(&only_tcp[24..26], &keep[24..26], "IPv4 header sum left alone");
+        let mut udp = tcp_frame(10, 0);
+        udp[23] = 17;
+        assert_eq!(tx_plan(&mut udp, S2XCSUM_IPV4 | S2XCSUM_TCPV4).flags, S2XCS_FILL_IP);
+        let mut arp = tcp_frame(10, 0);
+        arp[13] = 6;
+        assert_eq!(tx_plan(&mut arp, S2XCSUM_IPV4 | S2XCSUM_TCPV4), TxFill::default());
+        let c = Caps { present: true, version: 1, batch_frames: 8, tx_csum: S2XCSUM_IPV4 | S2XCSUM_TCPV4 | S2XCSUM_UDPV4, ..Caps::default() };
+        assert_eq!(tx_offload(&c), S2XCSUM_IPV4 | S2XCSUM_TCPV4);
+        assert_eq!(tx_offload(&Caps { batch_frames: 0, ..c }), 0);
     }
 
     #[test]

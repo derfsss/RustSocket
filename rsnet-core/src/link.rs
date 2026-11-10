@@ -51,7 +51,7 @@ use amigaos4::sana2::*;
 use amigaos4::sana2ext::{self as s2x, MinList, S2XBatch, S2XFrame, S2XFrameChecksum, S2XItem, S2XQuery};
 use amigaos4::sys::{self, TagItem};
 
-use crate::s2xlogic::{self, Caps, ReadNext, RxCsum};
+use crate::s2xlogic::{self, Caps, ReadNext, RxCsum, TxFill};
 
 /// Room for a frame: the Ethernet header, a 1500-byte MTU and spare.
 pub const FRAME_MAX: usize = 1600;
@@ -85,11 +85,14 @@ pub struct Buf {
     /// A received frame's s2xlogic TRUST_ bits: the checks the card made
     /// that smoltcp may skip (0: smoltcp verifies everything).
     pub(crate) trust: u8,
+    /// A frame to send: what the card is asked to fill (SANA-II
+    /// extensions; flags 0: nothing).
+    fill: TxFill,
 }
 
 impl Buf {
     fn new() -> Box<Self> {
-        Box::new(Buf { len: 0, data: [0; FRAME_MAX], trust: 0 })
+        Box::new(Buf { len: 0, data: [0; FRAME_MAX], trust: 0, fill: TxFill { flags: 0, start: 0, offset: 0 } })
     }
 
     /// The frame it holds.
@@ -113,6 +116,7 @@ impl Pool {
     fn take(&self) -> Box<Buf> {
         let mut b = self.0.borrow_mut().pop().unwrap_or_else(Buf::new);
         b.trust = 0;
+        b.fill = TxFill::default();
         b
     }
 
@@ -300,10 +304,14 @@ impl Batch {
                 s.frame.s2xf_Size = size_of::<S2XFrame>() as u32;
                 let items = addr_of_mut!(s.frame.s2xf_Items);
                 MinList::init(items);
-                if self.csum_item {
-                    s.csum.s2xfc_Flags = 0;
-                    s.csum.s2xfc_Start = 0;
-                    s.csum.s2xfc_Offset = 0;
+                // A read frame's item is filled by the driver; a write
+                // frame's says what the card is to fill, and is linked only
+                // when there is something.
+                let fill = if cmd == s2x::S2X_WRITEBATCH { s.req.buf.fill } else { TxFill::default() };
+                if self.csum_item && (cmd != s2x::S2X_WRITEBATCH || fill.flags != 0) {
+                    s.csum.s2xfc_Flags = fill.flags;
+                    s.csum.s2xfc_Start = fill.start;
+                    s.csum.s2xfc_Offset = fill.offset;
                     MinList::add_tail(items, addr_of_mut!(s.csum.s2xfc_Header.s2xi_Node));
                 }
                 MinList::add_tail(list, addr_of_mut!(s.frame.s2xf_Node));
@@ -458,6 +466,8 @@ pub struct LinkStats {
     /// found bad (dropped; also counted in rx_errors).
     pub rx_csum_ok: u32,
     pub rx_csum_bad: u32,
+    /// Frames sent with checksums left to the card.
+    pub tx_csum_offloaded: u32,
 }
 
 /// An opened SANA-II unit with its reads pending.
@@ -474,6 +484,9 @@ pub struct Link {
     tx_batch_on: bool,
     /// What the driver offers (all zero: plain SANA-II).
     pub caps: Caps,
+    /// The checksums left to the card on send (s2xlogic::tx_offload);
+    /// smoltcp does not compute them.
+    pub tx_offload: u32,
     write: Req,
     /// The buffer-management tags, read by OpenDevice.
     _tags: Box<[TagItem; 3]>,
@@ -544,6 +557,7 @@ impl Link {
             tx_batch: None,
             tx_batch_on: false,
             caps: Caps::default(),
+            tx_offload: 0,
             write,
             _tags: tags,
             mac: mac.unwrap_or([0; 6]),
@@ -576,7 +590,8 @@ impl Link {
                 }
             }
             let per = TX_PER_BATCH.min(max as usize).max(1);
-            link.tx_batch = Some(Batch::new(&link.port, &link.base, per, 0, false)?);
+            link.tx_offload = s2xlogic::tx_offload(&link.caps);
+            link.tx_batch = Some(Batch::new(&link.port, &link.base, per, 0, link.tx_offload != 0)?);
             link.tx_batch_on = true;
             for k in 0..link.rx_batches.len() {
                 link.post_batch(k);
@@ -872,16 +887,23 @@ impl Link {
     /// and whether it went. A frame shorter than its Ethernet header or
     /// longer than FRAME_MAX is not sent (`fill` runs on a scratch buffer).
     pub fn send_with<R>(&mut self, len: usize, fill: impl FnOnce(&mut [u8]) -> R) -> (R, bool) {
-        self.send_inner(len, fill, true)
+        self.send_inner(len, fill, true, false)
+    }
+
+    /// As send_with, for a frame smoltcp built: the checksums in
+    /// tx_offload are still to be done (by the card, or here when the
+    /// frame goes out as a plain write).
+    pub(crate) fn send_stack<R>(&mut self, len: usize, fill: impl FnOnce(&mut [u8]) -> R) -> (R, bool) {
+        self.send_inner(len, fill, true, true)
     }
 
     /// Send one whole frame without the IP filter (a datagram its "to" /
     /// "dup-to" rule routes: ipfil.rs).
     pub(crate) fn send_unfiltered(&mut self, frame: &[u8]) -> bool {
-        self.send_inner(frame.len(), |b| b.copy_from_slice(frame), false).1
+        self.send_inner(frame.len(), |b| b.copy_from_slice(frame), false, false).1
     }
 
-    fn send_inner<R>(&mut self, len: usize, fill: impl FnOnce(&mut [u8]) -> R, filter: bool) -> (R, bool) {
+    fn send_inner<R>(&mut self, len: usize, fill: impl FnOnce(&mut [u8]) -> R, filter: bool, stack: bool) -> (R, bool) {
         if len < 14 || len > FRAME_MAX {
             self.stats.tx_errors += 1;
             return (fill(&mut alloc::vec![0u8; len]), false);
@@ -900,6 +922,13 @@ impl Link {
         } else {
             len
         };
+        // The card's checksums, readied after the filter and NAT (which
+        // may change addresses and ports) on the frame as it goes out. A
+        // monitoring hook, bpf and the filter hook see the frame without
+        // them, as with checksum offload elsewhere.
+        if stack && self.tx_offload != 0 {
+            b.fill = s2xlogic::tx_plan(&mut b.data[..len], self.tx_offload);
+        }
         let frame = &b.data[..len];
         // A monitoring hook (MHT_Packet) may drop it.
         if !crate::monitor::frame(frame, false) {
@@ -969,6 +998,9 @@ impl Link {
             for s in tb.slots[..o.sent].iter() {
                 self.stats.tx_frames += 1;
                 self.stats.tx_bytes += s.req.buf.len as u64;
+                if s.req.buf.fill.flags != 0 {
+                    self.stats.tx_csum_offloaded += 1;
+                }
             }
             self.stats.tx_batches += 1;
             self.stats.tx_batch_frames += o.sent as u32;
@@ -1017,6 +1049,11 @@ impl Link {
     /// Write the `len` bytes in the write request's buffer and wait for the
     /// device: io_Error (0: it has the frame, counted).
     fn write_now(&mut self, len: usize) -> i8 {
+        // Left to a card that did not get the frame in a batch: done here.
+        let fill = core::mem::take(&mut self.write.buf.fill);
+        if fill.flags != 0 {
+            s2xlogic::tx_software(&mut self.write.buf.data[..len], fill);
+        }
         let frame = &self.write.buf.data[..len];
         let ptype = u16::from_be_bytes([frame[12], frame[13]]) as u32;
         let mut dst = [0u8; 6];
