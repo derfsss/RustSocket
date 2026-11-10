@@ -727,8 +727,8 @@ impl Link {
     fn report_caps(&self, device: &str, unit: u32) {
         let c = &self.caps;
         amigaos4::serial_println!(
-            "rsnet: {} unit {}: SANA-II extensions version {} revision {}: batches of {} frames, rx checksums {:#x}, tx checksums {:#x}, segmentation {:#x} (up to {} bytes), MTU {}-{}, RSS {} queues",
-            device, unit, c.version, c.revision, c.batch_frames, c.rx_csum, c.tx_csum, c.seg_protocols, c.seg_max_size, c.mtu_min, c.mtu_max, c.rss_queues
+            "rsnet: {} unit {}: SANA-II extensions version {} revision {}: batches of {} frames, rx checksums {:#x}, tx checksums {:#x}, segmentation {:#x} (up to {} bytes), MTU {}-{}, RSS {} queues; settings {:?}",
+            device, unit, c.version, c.revision, c.batch_frames, c.rx_csum, c.tx_csum, c.seg_protocols, c.seg_max_size, c.mtu_min, c.mtu_max, c.rss_queues, self.hw
         );
     }
 
