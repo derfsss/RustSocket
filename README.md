@@ -74,7 +74,7 @@ settings, all on the same day:
 | `docs/settings.md` | every setting (RoadshowControl options), Roadshow's and rustsocket's own |
 | `docs/sana2-extensions.md` | the SANA-II extensions: what they do for users, and what rustsocket asks of a driver |
 | `release/ReadMe` | the end-user ReadMe that goes into the release archive |
-| `testprogs/` | AmigaOS test programs: `rstcp` (the library's checks, with C probes in `rstcp/c/`), `netprof` (network profiler), `rsnet` and `rsprobe` (the stack core and the library's openers) |
+| `testprogs/` | AmigaOS test programs: `rstcp` (the library's checks, with C probes in `rstcp/c/`), `netprof` (network profiler), `rsnet` and `rsprobe` (the stack core and the library's openers), `s2xtest` (conformance test for drivers with the SANA-II extensions) |
 | `tools/` | `build-package.sh`, `build-all.sh`, `netprof-host` (netprof's peer on a PC), the generators of the PPC and 68k jump tables, small host-side servers the tests use |
 | `amigaos4/` | the [amigaos4](https://github.com/derfsss/rust-amigaos4-crate) crate (AmigaOS 4 bindings for Rust), a git submodule |
 | `third_party/smoltcp-0.14.0/` | smoltcp 0.14.0, vendored with small patches (each marked "VirtioRust patch" or "rustsocket patch"): buffer resizing for auto-tuning, the window-scale choice, neighbour-cache access for the ARP table, route selection, TCP loss counters |
@@ -124,6 +124,9 @@ Roadshow's file back returns to Roadshow.
   on Roadshow first and then on rustsocket.
 - `testprogs/netprof`: the network profiler (throughput, CPU, round trips,
   the stack's and driver's counters) against `tools/netprof-host` on a PC.
+- `testprogs/s2xtest`: checks a network driver's SANA-II extensions
+  against the specification, item by item, without a TCP/IP stack (see
+  its [README](testprogs/s2xtest/README.md)).
 - smoltcp's own unit tests, on the host:
   `cargo test --lib --features socket-tcp-reno` in
   `third_party/smoltcp-0.14.0`.

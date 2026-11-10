@@ -1,0 +1,26 @@
+[package]
+name = "s2xtest"
+version = "0.1.0"
+edition = "2021"
+authors = ["Richard Gibbs <rich_gibbs@hotmail.com>"]
+license = "MIT"
+autobins = false
+
+[lib]
+name = "s2xtest"
+crate-type = ["staticlib"]
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+
+[dependencies]
+# The amigaos4 crate (this repository's submodule):
+# the sana2ext layouts come from it. Build against the same crate commit
+# as the driver under test (both: sana2ext version 1).
+amigaos4 = { path = "../../amigaos4", default-features = false, features = ["dos", "device", "sana2", "timer"] }

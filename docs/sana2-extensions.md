@@ -188,10 +188,10 @@ it can put them back at close.
 
 ### Testing a driver
 
-- **s2xtest**, the conformance test written with igb.device (not yet
-  published), checks a driver against the specification item by item:
-  query, batches, checksums both ways, segmentation, settings, RSS, and
-  the refusal rules. It needs two ports on one link, or one port plus a
+- **s2xtest** ([testprogs/s2xtest](../testprogs/s2xtest/README.md))
+  checks a driver against the specification item by item: query,
+  batches, checksums both ways, segmentation, settings, RSS, and the
+  refusal rules. It needs two ports on one link, or one port plus a
   router to talk to.
 - **netprof** (`testprogs/netprof`, with `tools/netprof-host` on a PC)
   measures throughput and CPU through rustsocket and prints the driver's

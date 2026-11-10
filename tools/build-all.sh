@@ -11,6 +11,7 @@ bash $B testprogs/rstcp
 bash $B testprogs/rsprobe
 bash $B testprogs/rsnet
 bash $B testprogs/netprof
+bash $B testprogs/s2xtest
 ls -la rustsocket/rustsocket.library rustsocket/dropin/bsdsocket.library \
        testprogs/rstcp/rstcp testprogs/rsprobe/rsprobe testprogs/rsnet/rsnet \
-       testprogs/netprof/netprof
+       testprogs/netprof/netprof testprogs/s2xtest/s2xtest
