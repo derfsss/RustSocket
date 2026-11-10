@@ -40,6 +40,7 @@ Contents:
 | Driver | Cards | Extensions |
 |---|---|---|
 | [igb.device](https://github.com/derfsss/igb) | Intel I210, I211, I350, 82576 (gigabit) | all of them |
+| [e1000e.device](https://github.com/derfsss/e1000e) 0.2 | Intel 82574L (gigabit) | all but receive-side scaling; TCP segmentation over IPv4 |
 
 Any other driver is used through plain SANA-II, as before. Nothing needs
 to be set up: rustsocket asks each driver when an interface is added.
