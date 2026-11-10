@@ -86,7 +86,7 @@ Every code in bsdsocket.h is handled, by value and by reference.
 
 The stack-wide options are Roadshow's, read and changed with
 RoadshowControl, ChangeRoadshowData or ENV:Roadshow/<area>/<name>, with
-two additions of rustsocket's own:
+additions of rustsocket's own:
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -94,6 +94,29 @@ two additions of rustsocket's own:
 | tcp.recvspace.max | 1 MB | the size the receive buffer may grow to. Once per round trip the stack measures how fast the program reads and sizes the buffer to twice the data in flight; it shrinks back when the transfer slows down or the connection goes idle. On a LAN (round trip under 2 ms) it stops at 512 KB, which kept the data in the cache and was faster on an AmigaOne X5000 |
 | tcp.sendspace | 64 KB | a TCP connection's send buffer to start with (Roadshow: 32 KB) |
 | tcp.sendspace.max | 64 KB | the size the send buffer may grow to, in the same way, on paths with a round trip of 2 ms or more. The default (equal to tcp.sendspace) means no growth: internet uploads measured from an X5000 were no faster with a larger ceiling |
+| if.moderation.rx, if.moderation.tx | -1 | interrupt moderation, in microseconds between interrupts (0: off), for receive and send, on every interface whose driver can set it (SANA-II extensions, below); -1 leaves the driver's own. A driver that cannot set send apart uses the receive value for both |
+| if.flowcontrol | -1 | Ethernet flow control (pause frames) on those interfaces: 1 receive, 2 send, 4 negotiated, added together; 0 off; -1 leaves the driver's own |
+
+## SANA-II extensions
+
+rustsocket uses the unofficial SANA-II extensions (sana2ext, version 1:
+docs/devices/sana2ext.md of the amigaos4 crate) when a driver offers them,
+and plain SANA-II otherwise:
+
+- frames read and written several per request (S2X_READBATCH,
+  S2X_WRITEBATCH);
+- receive checksums checked by the card are not checked again, and frames
+  the card found bad are dropped (counted as input errors). While the IP
+  filter runs or a filter hook is installed every frame is checked, since
+  those may change it;
+- the IPv4 header and TCP checksums of frames sent are computed by the
+  card. Monitoring hooks, bpf (tcpdump) and the filter hook see those
+  frames before the card has filled the fields in;
+- MTU: an MTU larger than the driver's (the MTU option of
+  DEVS:NetInterfaces, ConfigureNetInterface MTU) changes the driver's MTU,
+  within what it allows (jumbo frames). Roadshow, like rustsocket with
+  any other driver, only lowers it;
+- interrupt moderation and flow control from the if.* options above.
 
 ## Roadshow's tools on rustsocket
 
@@ -101,10 +124,10 @@ two additions of rustsocket's own:
 |---|---|
 | GetNetStatus, CheckRoadshowConfig, ManageNetInterfaces | work |
 | AddNetInterface | works from Roadshow's own S:Network-Startup: the interface is added, DHCP runs through the allocation message, the default route and name servers are added |
-| ConfigureNetInterface | works: MTU (used for new connections), METRIC, BROADCASTADDR, ALIASADDR/DELETEADDR (aliases survive DHCP renewals), DEBUG, RELEASE. Not yet: point-to-point (DESTINATION), ONLINE/OFFLINE |
+| ConfigureNetInterface | works: MTU (used for new connections; larger than the driver's with the SANA-II extensions), METRIC, BROADCASTADDR, ALIASADDR/DELETEADDR (aliases survive DHCP renewals), DEBUG, RELEASE. Not yet: point-to-point (DESTINATION), ONLINE/OFFLINE |
 | RemoveNetInterface | works: removes an interface that no connection uses; FORCE always. Differs: Roadshow refuses ("Device busy") every non-forced removal once the interface was configured; rustsocket follows the autodoc (refuse only while in use) |
 | AddNetRoute, DeleteNetRoute | work (the blank addresses in their messages are the tools' own, also on Roadshow) |
-| ShowNetStatus | works: summary, INTERFACES, ROUTES and DNS print as on Roadshow but for the traffic counters and I/O request figures (rustsocket keeps 36 reads and 1 write per interface) |
+| ShowNetStatus | works: summary, INTERFACES, ROUTES and DNS print as on Roadshow but for the traffic counters and I/O request figures (rustsocket keeps 36 reads and 1 write per interface, or with the SANA-II extensions the frames of its read batches and of one write batch) |
 | RoadshowControl | works: lists, GET and SET |
 | ping, traceroute | work as on Roadshow |
 | arp | works: -a, a host, -s and -d (on Roadshow 1.15 itself arp -s and -d hang on QEMU) |

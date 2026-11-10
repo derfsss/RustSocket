@@ -437,6 +437,12 @@ impl Interface {
         self.inner.neighbor_cache.fill_with_expiration(protocol_addr, hardware_addr, expires_at);
     }
 
+    /// rustsocket patch: take the device's capabilities again, after its
+    /// MTU changed (the interface keeps those it was created with).
+    pub fn update_device_caps(&mut self, device: &(impl Device + ?Sized)) {
+        self.inner.caps = device.capabilities();
+    }
+
     /// rustsocket patch: forget a neighbor cache entry; whether it was there.
     #[cfg(feature = "medium-ethernet")]
     pub fn neighbor_remove(&mut self, protocol_addr: &IpAddress) -> bool {

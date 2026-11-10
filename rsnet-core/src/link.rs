@@ -53,7 +53,9 @@ use amigaos4::sys::{self, TagItem};
 
 use crate::s2xlogic::{self, Caps, ReadNext, RxCsum, TxFill};
 
-/// Room for a frame: the Ethernet header, a 1500-byte MTU and spare.
+/// Room for a frame: the Ethernet header, a 1500-byte MTU and spare; the
+/// smallest buffer a link uses (a larger MTU gets larger ones:
+/// s2xlogic::frame_size).
 pub const FRAME_MAX: usize = 1600;
 /// sizeof(struct IOSana2Req).
 const IOS2_SIZE: u32 = 88;
@@ -81,7 +83,8 @@ const TX_QUEUE_MAX: usize = 256;
 #[repr(C)]
 pub struct Buf {
     len: u32,
-    data: [u8; FRAME_MAX],
+    /// The room, of the link's frame size when it was made.
+    data: Box<[u8]>,
     /// A received frame's s2xlogic TRUST_ bits: the checks the card made
     /// that smoltcp may skip (0: smoltcp verifies everything).
     pub(crate) trust: u8,
@@ -91,13 +94,18 @@ pub struct Buf {
 }
 
 impl Buf {
-    fn new() -> Box<Self> {
-        Box::new(Buf { len: 0, data: [0; FRAME_MAX], trust: 0, fill: TxFill { flags: 0, start: 0, offset: 0 } })
+    fn new(size: usize) -> Box<Self> {
+        Box::new(Buf { len: 0, data: alloc::vec![0u8; size].into_boxed_slice(), trust: 0, fill: TxFill { flags: 0, start: 0, offset: 0 } })
     }
 
     /// The frame it holds.
     pub fn frame(&self) -> &[u8] {
-        &self.data[..(self.len as usize).min(FRAME_MAX)]
+        &self.data[..(self.len as usize).min(self.data.len())]
+    }
+
+    /// The room it has.
+    fn size(&self) -> usize {
+        self.data.len()
     }
 
     /// The whole buffer and the frame's length, to change the frame (the
@@ -108,21 +116,54 @@ impl Buf {
 }
 
 /// Spare receive buffers: a received frame's buffer comes back here once
-/// smoltcp has read it (the stack process's only task uses it).
-#[derive(Clone, Default)]
-pub struct Pool(Rc<RefCell<Vec<Box<Buf>>>>);
+/// smoltcp has read it (the stack process's only task uses it). All of
+/// one size, the link's frame size; one of another size (from before an
+/// MTU change) is let go when it comes back.
+#[derive(Clone)]
+pub struct Pool(Rc<RefCell<PoolIn>>);
+
+struct PoolIn {
+    bufs: Vec<Box<Buf>>,
+    size: usize,
+}
+
+impl Default for Pool {
+    fn default() -> Self {
+        Pool(Rc::new(RefCell::new(PoolIn { bufs: Vec::new(), size: FRAME_MAX })))
+    }
+}
 
 impl Pool {
     fn take(&self) -> Box<Buf> {
-        let mut b = self.0.borrow_mut().pop().unwrap_or_else(Buf::new);
+        let mut p = self.0.borrow_mut();
+        let size = p.size;
+        let mut b = p.bufs.pop().unwrap_or_else(|| Buf::new(size));
         b.trust = 0;
         b.fill = TxFill::default();
+        b.len = 0;
         b
     }
 
     /// Hand a buffer back for the next read.
     pub fn give(&self, b: Box<Buf>) {
-        self.0.borrow_mut().push(b);
+        let mut p = self.0.borrow_mut();
+        if b.size() == p.size {
+            p.bufs.push(b);
+        }
+    }
+
+    /// The buffers' size.
+    fn size(&self) -> usize {
+        self.0.borrow().size
+    }
+
+    /// Buffers of `size` from now on (the spares of another size go).
+    fn set_size(&self, size: usize) {
+        let mut p = self.0.borrow_mut();
+        if p.size != size {
+            p.size = size;
+            p.bufs.clear();
+        }
     }
 }
 
@@ -130,13 +171,14 @@ impl Pool {
 // calls them in its own task or the caller's, with our cookie on one side.
 unsafe extern "C" fn copy_to_buff(to: *mut c_void, from: *mut c_void, n: u32) -> u32 {
     let b = to as *mut Buf;
-    if b.is_null() || n as usize > FRAME_MAX {
+    // SAFETY: `to` is the cookie of one of our requests (a live Buf).
+    if b.is_null() || n as usize > unsafe { (&(*b).data).len() } {
         return 0;
     }
     // SAFETY: `to` is the cookie of one of our requests (a live Buf) and
     // `from` holds `n` bytes (the device's contract); n fits.
     unsafe {
-        core::ptr::copy_nonoverlapping(from as *const u8, (*b).data.as_mut_ptr(), n as usize);
+        core::ptr::copy_nonoverlapping(from as *const u8, (&mut (*b).data).as_mut_ptr(), n as usize);
         (*b).len = n;
     }
     1
@@ -150,7 +192,7 @@ unsafe extern "C" fn copy_from_buff(to: *mut c_void, from: *mut c_void, n: u32) 
     }
     // SAFETY: as above; `to` has room for `n` bytes (the device's contract)
     // and the Buf holds `n`.
-    unsafe { core::ptr::copy_nonoverlapping((*b).data.as_ptr(), to as *mut u8, n as usize) };
+    unsafe { core::ptr::copy_nonoverlapping((&(*b).data).as_ptr(), to as *mut u8, n as usize) };
     1
 }
 
@@ -204,7 +246,7 @@ impl Req {
         let ior = unsafe { sys::exec_create_iorequest(port.as_ptr(), IOS2_SIZE) };
         // SAFETY: a fresh 88-byte request (or NULL, refused here).
         let r = unsafe { S2Req::from_raw(ior) }.ok_or_else(|| String::from("CreateIORequest failed"))?;
-        Ok(Self { r, buf: Buf::new(), ptype: 0 })
+        Ok(Self { r, buf: Buf::new(FRAME_MAX), ptype: 0 })
     }
 
     fn cookie(&mut self) -> *mut c_void {
@@ -255,7 +297,7 @@ struct Batch {
 }
 
 impl Batch {
-    fn new(port: &AmigaMsgPort, base: &Req, frames: usize, ptype: u32, csum_item: bool) -> Result<Self, String> {
+    fn new(port: &AmigaMsgPort, base: &Req, frames: usize, size: usize, ptype: u32, csum_item: bool) -> Result<Self, String> {
         let req = Link::copy_of(port, base)?;
         let batch = Box::new(S2XBatch {
             s2xb_Size: size_of::<S2XBatch>() as u32,
@@ -267,7 +309,12 @@ impl Batch {
         let mut b = Batch { req, batch, slots: Vec::with_capacity(frames), ptype, csum_item, in_flight: false, dead: false };
         for _ in 0..frames {
             let r = match Link::copy_of(port, base) {
-                Ok(r) => r,
+                Ok(mut r) => {
+                    if r.buf.size() != size {
+                        r.buf = Buf::new(size);
+                    }
+                    r
+                }
                 Err(e) => {
                     b.delete();
                     return Err(e);
@@ -484,6 +531,8 @@ pub struct Link {
     tx_batch_on: bool,
     /// What the driver offers (all zero: plain SANA-II).
     pub caps: Caps,
+    /// The unit's settings as the driver reported them.
+    pub hw: s2xlogic::HwSettings,
     /// The checksums left to the card on send (s2xlogic::tx_offload);
     /// smoltcp does not compute them.
     pub tx_offload: u32,
@@ -492,6 +541,9 @@ pub struct Link {
     _tags: Box<[TagItem; 3]>,
     pub mac: [u8; 6],
     pub mtu: u32,
+    /// The driver's MTU (`mtu` may be lower: IFC_LimitMTU); the buffers
+    /// are sized from it.
+    pub hw_mtu: u32,
     /// From S2_DEVICEQUERY: bits per second, the SANA-II hardware type,
     /// the address size in bits.
     pub bps: u32,
@@ -557,11 +609,13 @@ impl Link {
             tx_batch: None,
             tx_batch_on: false,
             caps: Caps::default(),
+            hw: s2xlogic::HwSettings::default(),
             tx_offload: 0,
             write,
             _tags: tags,
             mac: mac.unwrap_or([0; 6]),
             mtu: 1500,
+            hw_mtu: 1500,
             bps: 0,
             hw_type: 0,
             addr_bits: 48,
@@ -577,7 +631,9 @@ impl Link {
         };
         // From here, dropping `link` closes the device.
         link.query()?;
+        link.write.buf = link.pool.take();
         link.caps = discover(&mut link.base);
+        link.read_settings();
         if link.caps.batches() {
             link.report_caps(device, unit);
             let max = link.caps.batch_frames;
@@ -585,13 +641,13 @@ impl Link {
             for (ptype, want, prefer) in [(0x0800u32, IPV4_BATCH_FRAMES, IPV4_PER_BATCH), (0x0806, ARP_BATCH_FRAMES, ARP_PER_BATCH)] {
                 let (n, per) = s2xlogic::plan_reads(want, max, prefer);
                 for _ in 0..n {
-                    let b = Batch::new(&link.port, &link.base, per, ptype, csum)?;
+                    let b = Batch::new(&link.port, &link.base, per, link.pool.size(), ptype, csum)?;
                     link.rx_batches.push(b);
                 }
             }
             let per = TX_PER_BATCH.min(max as usize).max(1);
             link.tx_offload = s2xlogic::tx_offload(&link.caps);
-            link.tx_batch = Some(Batch::new(&link.port, &link.base, per, 0, link.tx_offload != 0)?);
+            link.tx_batch = Some(Batch::new(&link.port, &link.base, per, link.pool.size(), 0, link.tx_offload != 0)?);
             link.tx_batch_on = true;
             for k in 0..link.rx_batches.len() {
                 link.post_batch(k);
@@ -610,6 +666,7 @@ impl Link {
     fn add_reads(&mut self, ptype: u32, n: usize) -> Result<(), String> {
         for _ in 0..n {
             let mut r = Self::copy_of(&self.port, &self.base)?;
+            r.buf = self.pool.take();
             r.ptype = ptype;
             self.reads.push(r);
             let k = self.reads.len() - 1;
@@ -635,7 +692,7 @@ impl Link {
         for s in b.slots.iter_mut() {
             s.req.set(CMD_READ, SANA2IOF_RAW);
             s.req.r.set_packet_type(ptype);
-            s.req.r.set_data_length(FRAME_MAX as u32);
+            s.req.r.set_data_length(s.req.buf.size() as u32);
         }
         let n = b.slots.len();
         b.arm(n, s2x::S2X_READBATCH);
@@ -655,7 +712,7 @@ impl Link {
                 self.stats.rx_errors += 1;
                 continue;
             }
-            let n = (s.req.buf.len as usize).min(FRAME_MAX);
+            let n = (s.req.buf.len as usize).min(s.req.buf.size());
             let flags = if b.csum_item { s.csum.s2xfc_Flags } else { 0 };
             // The frame's buffer goes to the queue, a spare one takes its
             // place (set as the cookie when the batch is posted again).
@@ -706,6 +763,197 @@ impl Link {
         }
     }
 
+    /// S2X_CONFIGURE with the settings given (None: not in the list):
+    /// `read` reads the current values instead of changing them. The
+    /// values the driver reports (read, or written back after a change)
+    /// go into `hw`. Err: (io_Error, the refused item's type or 0).
+    fn configure(&mut self, read: bool, mtu: Option<u32>, moderation: Option<(u32, u32)>, flow: Option<u32>) -> Result<(), (i8, u32)> {
+        let mut m = Box::new(s2x::S2XSetMTU { s2xsm_Header: S2XItem::new(s2x::S2XSET_MTU, size_of::<s2x::S2XSetMTU>()), s2xsm_MTU: mtu.unwrap_or(0), s2xsm_Reserved: 0 });
+        let (rx, tx) = moderation.unwrap_or((0, 0));
+        let mut o = Box::new(s2x::S2XSetModeration { s2xso_Header: S2XItem::new(s2x::S2XSET_MODERATION, size_of::<s2x::S2XSetModeration>()), s2xso_RxMicros: rx, s2xso_TxMicros: tx });
+        let mut f = Box::new(s2x::S2XSetFlowControl { s2xsf_Header: S2XItem::new(s2x::S2XSET_FLOWCONTROL, size_of::<s2x::S2XSetFlowControl>()), s2xsf_Modes: flow.unwrap_or(0), s2xsf_Reserved: 0 });
+        let mut c = Box::new(s2x::S2XConfigure {
+            s2xc_Size: size_of::<s2x::S2XConfigure>() as u32,
+            s2xc_Flags: if read { s2x::S2XCF_READ } else { 0 },
+            s2xc_Items: MinList { mlh_Head: null_mut(), mlh_Tail: null_mut(), mlh_TailPred: null_mut() },
+            s2xc_Failed: null_mut(),
+        });
+        let list = addr_of_mut!(c.s2xc_Items);
+        // SAFETY: the boxed items and list stay put until DoIO returns; the
+        // items are in setting-type order.
+        unsafe {
+            MinList::init(list);
+            if mtu.is_some() {
+                MinList::add_tail(list, addr_of_mut!(m.s2xsm_Header.s2xi_Node));
+            }
+            if moderation.is_some() {
+                MinList::add_tail(list, addr_of_mut!(o.s2xso_Header.s2xi_Node));
+            }
+            if flow.is_some() {
+                MinList::add_tail(list, addr_of_mut!(f.s2xsf_Header.s2xi_Node));
+            }
+            if MinList::is_empty(list) {
+                return Ok(());
+            }
+        }
+        self.base.set(s2x::S2X_CONFIGURE, 0);
+        self.base.r.set_stat_data(&mut *c as *mut s2x::S2XConfigure as *mut c_void);
+        // SAFETY: our opened request, not in use; the structure and its
+        // items live across the call (the driver uses them only until it
+        // replies).
+        unsafe { sys::exec_do_io(self.base.r.as_ptr()) };
+        self.base.r.set_stat_data(null_mut());
+        let err = self.base.r.io().error();
+        if err != 0 {
+            let failed = c.s2xc_Failed;
+            // SAFETY: NULL or one of our items (the spec).
+            let ty = if failed.is_null() { 0 } else { unsafe { addr_of!((*failed).s2xi_Type).read_unaligned() } };
+            return Err((err, ty));
+        }
+        if mtu.is_some() {
+            self.hw.mtu = Some(m.s2xsm_MTU);
+        }
+        if moderation.is_some() {
+            self.hw.moderation = Some((o.s2xso_RxMicros, o.s2xso_TxMicros));
+        }
+        if flow.is_some() {
+            self.hw.flow_control = Some(f.s2xsf_Modes);
+        }
+        Ok(())
+    }
+
+    /// Read the unit's settings the driver offers into `hw`.
+    fn read_settings(&mut self) {
+        let c = self.caps;
+        if !c.present {
+            return;
+        }
+        let mtu = (c.mtu_max > 0).then_some(0);
+        let modr = c.moderation.then_some((0, 0));
+        let fc = c.flow_control.then_some(0);
+        if let Err((e, ty)) = self.configure(true, mtu, modr, fc) {
+            amigaos4::serial_println!("rsnet: S2X_CONFIGURE (read) refused: io_Error {} item {:#06x}", e, ty);
+        }
+    }
+
+    /// The stack options if.moderation.rx / .tx and if.flowcontrol, to a
+    /// driver that offers those settings (DRIVER_DEFAULT leaves its own).
+    /// True when something changed.
+    pub fn apply_options(&mut self, rx_us: i32, tx_us: i32, flow: i32) -> bool {
+        let m = s2xlogic::moderation_change(&self.caps, rx_us, tx_us, self.hw.moderation);
+        let f = s2xlogic::flow_control_change(&self.caps, flow, self.hw.flow_control);
+        if m.is_none() && f.is_none() {
+            return false;
+        }
+        match self.configure(false, None, m, f) {
+            Ok(()) => {
+                amigaos4::serial_println!("rsnet: interface {}: moderation {:?} us, flow control {:?}", self.slot, self.hw.moderation, self.hw.flow_control);
+                true
+            }
+            Err((e, ty)) => {
+                amigaos4::serial_println!("rsnet: interface {}: S2X_CONFIGURE refused: io_Error {} item {:#06x}", self.slot, e, ty);
+                false
+            }
+        }
+    }
+
+    /// Change the driver's MTU to `mtu` (S2XSET_MTU), as the spec has it:
+    /// the frames waiting to go out are written, every read is taken back
+    /// (AbortIO; what one filled is kept), the setting is made with no
+    /// read posted, the driver's new MTU is read (S2_DEVICEQUERY), the
+    /// buffers are sized for it, and the reads are posted again. The
+    /// driver refuses (S2ERR_BAD_STATE) while another opener has reads
+    /// posted. The link carries on at its old MTU after a refusal.
+    pub fn set_mtu(&mut self, mtu: u32) -> Result<(), String> {
+        if !self.caps.present || self.caps.mtu_max == 0 {
+            return Err(String::from("the driver cannot change its MTU"));
+        }
+        self.flush();
+        let was_closed = self.closed;
+        self.closed = true;
+        for k in 0..self.reads.len() {
+            let r = &self.reads[k];
+            // SAFETY: our request, in flight or replied and still on the
+            // port (poll re-posts every one it takes): AbortIO then WaitIO.
+            unsafe {
+                sys::exec_abort_io(r.r.as_ptr());
+                sys::exec_wait_io(r.r.as_ptr());
+            }
+            if self.reads[k].r.io().error() == 0 {
+                let n = (self.reads[k].buf.len as usize).min(self.reads[k].buf.size());
+                let mut full = core::mem::replace(&mut self.reads[k].buf, self.pool.take());
+                full.trust = 0;
+                self.rx.push_back(full);
+                self.stats.rx_frames += 1;
+                self.stats.rx_bytes += n as u64;
+            }
+        }
+        for k in 0..self.rx_batches.len() {
+            if !self.rx_batches[k].in_flight {
+                continue;
+            }
+            // SAFETY: as above, through the batch's own request only.
+            unsafe {
+                sys::exec_abort_io(self.rx_batches[k].req.r.as_ptr());
+                sys::exec_wait_io(self.rx_batches[k].req.r.as_ptr());
+            }
+            // Its frames into the queue; not posted again (closed).
+            self.take_batch(k);
+        }
+        let result = match self.configure(false, Some(mtu), None, None) {
+            Ok(()) => {
+                let got = self.device_mtu().unwrap_or(mtu);
+                if (576..=s2xlogic::MTU_MAX).contains(&got) {
+                    self.mtu = got;
+                    self.hw_mtu = got;
+                }
+                Ok(())
+            }
+            Err((e, ty)) => Err(alloc::format!("S2X_CONFIGURE refused: io_Error {} item {:#06x}", e, ty)),
+        };
+        // Buffers of the new size (the old ones go when they come back to
+        // the pool), then the reads again.
+        self.pool.set_size(s2xlogic::frame_size(self.hw_mtu));
+        for r in self.reads.iter_mut() {
+            r.buf = self.pool.take();
+        }
+        for b in self.rx_batches.iter_mut().chain(self.tx_batch.iter_mut()) {
+            for sl in b.slots.iter_mut() {
+                sl.req.buf = self.pool.take();
+            }
+        }
+        self.write.buf = self.pool.take();
+        self.closed = was_closed;
+        if !self.closed {
+            for k in 0..self.reads.len() {
+                self.post(k);
+            }
+            for k in 0..self.rx_batches.len() {
+                if !self.rx_batches[k].dead {
+                    self.post_batch(k);
+                }
+            }
+        }
+        amigaos4::serial_println!("rsnet: interface {}: driver MTU now {} ({})", self.slot, self.hw_mtu, if result.is_ok() { "changed" } else { "refused" });
+        result
+    }
+
+    /// S2_DEVICEQUERY's MTU.
+    fn device_mtu(&mut self) -> Option<u32> {
+        let mut q = Box::new([0u8; 34]);
+        q[0..4].copy_from_slice(&34u32.to_be_bytes());
+        self.base.set(S2_DEVICEQUERY, 0);
+        self.base.r.set_stat_data(q.as_mut_ptr() as *mut c_void);
+        // SAFETY: our opened request; q is a 34-byte Sana2DeviceQuery with
+        // its size field set, alive across the call.
+        unsafe { sys::exec_do_io(self.base.r.as_ptr()) };
+        self.base.r.set_stat_data(null_mut());
+        if self.base.r.io().error() != 0 {
+            return None;
+        }
+        Some(u32::from_be_bytes([q[18], q[19], q[20], q[21]]))
+    }
+
     /// A new request on `port` copied from `base` (device, unit, buffer
     /// management), with a buffer of its own.
     fn copy_of(port: &AmigaMsgPort, base: &Req) -> Result<Req, String> {
@@ -745,8 +993,10 @@ impl Link {
         self.addr_bits = u16::from_be_bytes([q[16], q[17]]) as u32;
         self.bps = u32::from_be_bytes([q[22], q[23], q[24], q[25]]);
         self.hw_type = u32::from_be_bytes([q[26], q[27], q[28], q[29]]);
-        if mtu >= 576 && mtu as usize + 14 <= FRAME_MAX {
+        if (576..=s2xlogic::MTU_MAX).contains(&mtu) {
             self.mtu = mtu;
+            self.hw_mtu = mtu;
+            self.pool.set_size(s2xlogic::frame_size(mtu));
         }
         let (e, w) = self.do_io(S2_GETSTATIONADDRESS);
         if e != 0 {
@@ -777,7 +1027,7 @@ impl Link {
         let r = &mut self.reads[k];
         r.set(CMD_READ, SANA2IOF_RAW);
         r.r.set_packet_type(r.ptype);
-        r.r.set_data_length(FRAME_MAX as u32);
+        r.r.set_data_length(r.buf.size() as u32);
         // SAFETY: our opened request copy, not in flight; BeginIO keeps the
         // RAW flag (SendIO would clear it).
         unsafe { sys::exec_begin_io(r.r.as_ptr()) };
@@ -825,7 +1075,7 @@ impl Link {
                 {
                     taken += 1;
                 }
-                let n = (self.reads[k].buf.len as usize).min(FRAME_MAX);
+                let n = (self.reads[k].buf.len as usize).min(self.reads[k].buf.size());
                 if self.rx.len() < RX_QUEUE_MAX {
                     // The read takes a spare buffer; its own goes to the queue.
                     let mut full = core::mem::replace(&mut self.reads[k].buf, self.pool.take());
@@ -856,8 +1106,8 @@ impl Link {
     /// Take `frame` in as if the device had just read it (a datagram the IP
     /// filter's auth program let go: ipfil.rs SIOCAUTHR).
     pub(crate) fn inject(&mut self, frame: &[u8]) {
-        let n = frame.len().min(FRAME_MAX);
         let mut b = self.pool.take();
+        let n = frame.len().min(b.size());
         b.data[..n].copy_from_slice(&frame[..n]);
         b.len = n as u32;
         self.rx.push_front(b);
@@ -885,7 +1135,8 @@ impl Link {
     /// Send a frame of `len` bytes that `fill` writes into the write
     /// request's buffer, waiting until the device has it: `fill`'s result
     /// and whether it went. A frame shorter than its Ethernet header or
-    /// longer than FRAME_MAX is not sent (`fill` runs on a scratch buffer).
+    /// longer than the link's frame size is not sent (`fill` runs on a
+    /// scratch buffer).
     pub fn send_with<R>(&mut self, len: usize, fill: impl FnOnce(&mut [u8]) -> R) -> (R, bool) {
         self.send_inner(len, fill, true, false)
     }
@@ -904,7 +1155,7 @@ impl Link {
     }
 
     fn send_inner<R>(&mut self, len: usize, fill: impl FnOnce(&mut [u8]) -> R, filter: bool, stack: bool) -> (R, bool) {
-        if len < 14 || len > FRAME_MAX {
+        if len < 14 || len > self.pool.size() {
             self.stats.tx_errors += 1;
             return (fill(&mut alloc::vec![0u8; len]), false);
         }

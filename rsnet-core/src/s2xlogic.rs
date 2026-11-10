@@ -320,6 +320,90 @@ pub fn tx_software(frame: &mut [u8], fill: TxFill) {
     }
 }
 
+/// The largest MTU a link takes (a driver's S2_DEVICEQUERY or an MTU
+/// change), as Sana2DeviceQuery's MTU: packet data without the link header.
+pub const MTU_MAX: u32 = 16000;
+
+/// The receive and send buffer size for `mtu`: the Ethernet header, the
+/// MTU and room for a VLAN tag and the card's spare bytes; never below
+/// the 1500-byte MTU's.
+pub fn frame_size(mtu: u32) -> usize {
+    (mtu.min(MTU_MAX) as usize + 14 + 86).max(1600)
+}
+
+/// The unit's settings as the driver reported them (S2X_CONFIGURE with
+/// S2XCF_READ, and the values it wrote back after a change). A setting
+/// the driver does not offer stays None.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HwSettings {
+    pub mtu: Option<u32>,
+    /// Microseconds between interrupts, receive and send (0: off).
+    pub moderation: Option<(u32, u32)>,
+    /// S2XFC_ modes (0: off).
+    pub flow_control: Option<u32>,
+}
+
+/// What an IFA_LimitMTU / IFC_LimitMTU value asks of a link whose driver
+/// MTU is `hw`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MtuPlan {
+    /// Use this MTU, the driver's staying as it is (Roadshow's meaning:
+    /// a limit at most the driver's).
+    Limit(u32),
+    /// Change the driver's MTU to this (S2XSET_MTU), then use it: a larger
+    /// MTU than the driver's, which only a driver with S2XCAP_MTU can do.
+    Hardware(u32),
+}
+
+/// The plan for `want` (at least 68, IPv4's least).
+pub fn mtu_plan(c: &Caps, hw: u32, want: u32) -> MtuPlan {
+    let want = want.max(68);
+    if want <= hw {
+        return MtuPlan::Limit(want);
+    }
+    if !c.present || c.mtu_max <= hw {
+        return MtuPlan::Limit(hw);
+    }
+    let m = want.min(c.mtu_max).min(MTU_MAX).max(c.mtu_min);
+    if m > hw { MtuPlan::Hardware(m) } else { MtuPlan::Limit(hw) }
+}
+
+/// "Leave the driver's own value": the stack options' default.
+pub const DRIVER_DEFAULT: i32 = -1;
+
+/// The S2XSET_MODERATION values for the stack options `rx` / `tx`
+/// (microseconds; DRIVER_DEFAULT: leave), the current ones `cur`: None
+/// when there is nothing to change. Values past the driver's longest
+/// interval are cut to it; without S2XMOD_TX the receive value applies to
+/// both (the spec), so the send one follows it.
+pub fn moderation_change(c: &Caps, rx: i32, tx: i32, cur: Option<(u32, u32)>) -> Option<(u32, u32)> {
+    if !c.moderation || (rx < 0 && tx < 0) {
+        return None;
+    }
+    let (cr, ct) = cur.unwrap_or((0, 0));
+    let clamp = |v: i32, keep: u32| if v < 0 { keep } else { (v as u32).min(c.mod_max_us) };
+    let r = clamp(rx, cr);
+    let t = if c.mod_flags & S2XMOD_TX != 0 { clamp(tx, ct) } else { r };
+    if cur == Some((r, t)) {
+        return None;
+    }
+    Some((r, t))
+}
+
+/// The S2XSET_FLOWCONTROL modes for the stack option `v` (S2XFC_ bits;
+/// DRIVER_DEFAULT: leave), the current ones `cur`: None when there is
+/// nothing to change. Modes the card does not have are left out.
+pub fn flow_control_change(c: &Caps, v: i32, cur: Option<u32>) -> Option<u32> {
+    if !c.flow_control || v < 0 {
+        return None;
+    }
+    let m = v as u32 & c.fc_modes;
+    if cur == Some(m) {
+        return None;
+    }
+    Some(m)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,6 +613,41 @@ mod tests {
         let c = Caps { present: true, version: 1, batch_frames: 8, tx_csum: S2XCSUM_IPV4 | S2XCSUM_TCPV4 | S2XCSUM_UDPV4, ..Caps::default() };
         assert_eq!(tx_offload(&c), S2XCSUM_IPV4 | S2XCSUM_TCPV4);
         assert_eq!(tx_offload(&Caps { batch_frames: 0, ..c }), 0);
+    }
+
+    #[test]
+    fn mtu_plans() {
+        let jumbo = Caps { present: true, version: 1, mtu_min: 68, mtu_max: 9000, ..Caps::default() };
+        let plain = Caps::default();
+        assert_eq!(mtu_plan(&plain, 1500, 1400), MtuPlan::Limit(1400));
+        assert_eq!(mtu_plan(&plain, 1500, 9000), MtuPlan::Limit(1500), "plain SANA-II: at most the driver's");
+        assert_eq!(mtu_plan(&plain, 1500, 10), MtuPlan::Limit(68));
+        assert_eq!(mtu_plan(&jumbo, 1500, 9000), MtuPlan::Hardware(9000));
+        assert_eq!(mtu_plan(&jumbo, 1500, 20000), MtuPlan::Hardware(9000), "cut to the driver's most");
+        assert_eq!(mtu_plan(&jumbo, 9000, 1500), MtuPlan::Limit(1500), "lower: a limit, the card keeps 9000");
+        assert_eq!(mtu_plan(&jumbo, 9000, 9000), MtuPlan::Limit(9000));
+        let odd = Caps { mtu_min: 2000, mtu_max: 4000, ..jumbo };
+        assert_eq!(mtu_plan(&odd, 1500, 1600), MtuPlan::Hardware(2000), "raised to the driver's least");
+        assert_eq!(frame_size(1500), 1600);
+        assert_eq!(frame_size(9000), 9100);
+        assert_eq!(frame_size(60000), MTU_MAX as usize + 100);
+    }
+
+    #[test]
+    fn moderation_and_flow_control() {
+        let c = Caps { present: true, version: 1, moderation: true, mod_max_us: 1000, mod_flags: S2XMOD_RX | S2XMOD_TX, flow_control: true, fc_modes: S2XFC_RX | S2XFC_TX, ..Caps::default() };
+        assert_eq!(moderation_change(&c, -1, -1, Some((50, 50))), None, "both left to the driver");
+        assert_eq!(moderation_change(&c, 100, -1, Some((50, 20))), Some((100, 20)));
+        assert_eq!(moderation_change(&c, 5000, 0, Some((50, 20))), Some((1000, 0)), "cut to the longest");
+        assert_eq!(moderation_change(&c, 50, 20, Some((50, 20))), None, "no change");
+        let rx_only = Caps { mod_flags: S2XMOD_RX, ..c };
+        assert_eq!(moderation_change(&rx_only, 100, 7, Some((50, 50))), Some((100, 100)), "send follows receive");
+        assert_eq!(moderation_change(&Caps { moderation: false, ..c }, 100, 100, None), None);
+        assert_eq!(flow_control_change(&c, -1, Some(3)), None);
+        assert_eq!(flow_control_change(&c, 0, Some(3)), Some(0));
+        assert_eq!(flow_control_change(&c, 7, Some(0)), Some(S2XFC_RX | S2XFC_TX), "auto not offered");
+        assert_eq!(flow_control_change(&c, 3, Some(3)), None);
+        assert_eq!(flow_control_change(&Caps { flow_control: false, ..c }, 3, None), None);
     }
 
     #[test]

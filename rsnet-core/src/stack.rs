@@ -143,6 +143,8 @@ pub struct Status {
     /// What the driver offers through the SANA-II extensions (all zero:
     /// plain SANA-II).
     pub s2x: crate::s2xlogic::Caps,
+    /// The unit's settings as the driver reported them (S2X_CONFIGURE).
+    pub hw: crate::s2xlogic::HwSettings,
 }
 
 /// The interface's addresses: the primary (if any), then its aliases (with
@@ -384,12 +386,34 @@ fn iface_opts(sides: &mut [Side], nets: &mut [Net], name: &str, o: &IfaceOpts) -
     let k = slot_of(sides, name).ok_or(err::ENXIO)?;
     let side = &mut sides[k];
     if let Some(m) = o.mtu {
-        // Only a smaller one than the driver's (ConfigureNetInterface.doc).
+        // A smaller one than the driver's (ConfigureNetInterface.doc), or,
+        // with a driver that can change its MTU (SANA-II extensions), a
+        // larger one: the driver's MTU is changed (jumbo frames).
         let hw = if side.status.hw_mtu != 0 { side.status.hw_mtu } else { side.status.mtu };
-        let m = m.clamp(68, hw);
+        let plan = match side.link.as_ref() {
+            Some(l) => crate::s2xlogic::mtu_plan(&l.caps, hw, m),
+            None => crate::s2xlogic::MtuPlan::Limit(m.clamp(68, hw)),
+        };
+        let m = match (plan, side.link.as_mut()) {
+            (crate::s2xlogic::MtuPlan::Hardware(n), Some(l)) => match l.set_mtu(n) {
+                Ok(()) => {
+                    side.status.hw_mtu = l.hw_mtu;
+                    side.status.hw = l.hw;
+                    l.hw_mtu
+                }
+                Err(e) => {
+                    amigaos4::serial_println!("rsnet: {}: MTU {}: {}", side.name, n, e);
+                    hw
+                }
+            },
+            (crate::s2xlogic::MtuPlan::Hardware(_), None) => hw,
+            (crate::s2xlogic::MtuPlan::Limit(n), _) => n,
+        };
         side.status.mtu = m;
         if let Some(l) = side.link.as_mut() {
             l.mtu = m;
+            // smoltcp keeps the capabilities it was created with.
+            nets[k].iface.update_device_caps(l);
         }
     }
     if let Some(m) = o.metric {
@@ -463,6 +487,10 @@ fn add_iface(sides: &mut Vec<Side>, nets: &mut Vec<Net>, socks: &mut crate::sock
     let mut config = IfaceConfig::new(EthernetAddress(link.mac).into());
     *seed ^= u64::from_be_bytes([0, 0, link.mac[0], link.mac[1], link.mac[2], link.mac[3], link.mac[4], link.mac[5]]);
     config.random_seed = *seed;
+    // The stack's driver options (if.moderation.*, if.flowcontrol), to a
+    // driver that offers those settings.
+    let (rx_us, tx_us, flow) = crate::settings::SETTINGS.driver_options();
+    link.apply_options(rx_us, tx_us, flow);
     let iface = Interface::new(config, &mut link, now());
     let status = Status {
         name: String::from(name),
@@ -482,6 +510,7 @@ fn add_iface(sides: &mut Vec<Side>, nets: &mut Vec<Net>, socks: &mut crate::sock
         addr_bits: link.addr_bits,
         down_offline,
         s2x: link.caps,
+        hw: link.hw,
         ..Status::default()
     };
     let k = match again {
@@ -764,6 +793,8 @@ fn run(starter: Sender<Ctl>) {
     let mut fwd_waiting: Vec<crate::forward::Waiting> = Vec::new();
     // Set at the first pass from task.controller.priority.
     let mut priority: i8 = i8::MIN;
+    // The option changes seen: a change may be for the drivers.
+    let mut options_seen = crate::settings::generation();
     let mut quit: Option<Received<Ctl>> = None;
     // Frames at the last perf report (feature perf).
     let (mut perf_in, mut perf_out) = (0u64, 0u64);
@@ -776,6 +807,18 @@ fn run(starter: Sender<Ctl>) {
     ready(Ok((port.sender(), core.clone())));
 
     loop {
+        let g = crate::settings::generation();
+        if g != options_seen {
+            options_seen = g;
+            let (rx_us, tx_us, flow) = crate::settings::SETTINGS.driver_options();
+            for side in sides.iter_mut() {
+                if let Some(link) = side.link.as_mut() {
+                    if link.apply_options(rx_us, tx_us, flow) {
+                        side.status.hw = link.hw;
+                    }
+                }
+            }
+        }
         // The drivers' replies first, before the lock: the links are this
         // process's own (sides), and taking replies and posting the reads
         // again is mostly the driver's work (a re-posted read is often

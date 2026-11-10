@@ -19,7 +19,7 @@
 //!   Roadshow's default), 1 and 2 leave them unanswered);
 //! - kept, no effect yet: the rest.
 
-use core::sync::atomic::{AtomicI32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU8, Ordering};
 
 /// An ICMP request is answered.
 pub const IR_PROCESS: u32 = 0;
@@ -85,9 +85,28 @@ pub static OPTIONS: [Opt; N_OPTIONS] = [
     opt("task.controller.priority", 0, Rule::Range(-128, 127)),
     opt("if.receive.useclusters", 1, Rule::Range(0, 1)),
     opt("if.minclustersize", 208, Rule::Range(0, 2048)),
+    // Not Roadshow's: settings of a network unit whose driver offers them
+    // (the SANA-II extensions' S2X_CONFIGURE), applied to every such
+    // interface; -1 leaves the driver's own. Interrupt moderation in
+    // microseconds between interrupts for receive and send (0: off; a
+    // driver that cannot set send apart uses the receive value), and the
+    // flow-control modes (pause frames: 1 receive, 2 send, 4 negotiated;
+    // 0: off).
+    opt("if.moderation.rx", -1, Rule::Range(-1, 1_000_000)),
+    opt("if.moderation.tx", -1, Rule::Range(-1, 1_000_000)),
+    opt("if.flowcontrol", -1, Rule::Range(-1, 7)),
 ];
 
-const N_OPTIONS: usize = 25;
+const N_OPTIONS: usize = 28;
+
+/// Bumped by every change of an option, so the stack can tell when to look
+/// at those it hands to drivers.
+static GENERATION: AtomicU32 = AtomicU32::new(0);
+
+/// The number of option changes so far.
+pub fn generation() -> u32 {
+    GENERATION.load(Ordering::Relaxed)
+}
 
 static VALUES: [AtomicI32; N_OPTIONS] = {
     let mut v = [const { AtomicI32::new(0) }; N_OPTIONS];
@@ -149,6 +168,7 @@ pub fn set(name: &str, v: i32) -> Result<(), Refused> {
         return Err(Refused::Value);
     }
     VALUES[i].store(v, Ordering::Relaxed);
+    GENERATION.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
@@ -230,6 +250,15 @@ impl Settings {
         static R: AtomicU8 = NOT_YET;
         static S: AtomicU8 = NOT_YET;
         (val_c(&R, "udp.recvspace", 41600) as usize, val_c(&S, "udp.sendspace", 9216) as usize)
+    }
+
+    /// if.moderation.rx, if.moderation.tx, if.flowcontrol (-1: the
+    /// driver's own).
+    pub fn driver_options(&self) -> (i32, i32, i32) {
+        static R: AtomicU8 = NOT_YET;
+        static T: AtomicU8 = NOT_YET;
+        static F: AtomicU8 = NOT_YET;
+        (val_c(&R, "if.moderation.rx", -1), val_c(&T, "if.moderation.tx", -1), val_c(&F, "if.flowcontrol", -1))
     }
 
     /// The stack process's priority.
