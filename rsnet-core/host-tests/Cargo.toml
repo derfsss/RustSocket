@@ -1,0 +1,12 @@
+[package]
+name = "rsnet-host-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Host tests of rsnet-core's device-free logic (cargo test here)"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+amigaos4 = { path = "../../amigaos4", default-features = false, features = ["sana2"] }

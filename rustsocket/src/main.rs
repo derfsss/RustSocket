@@ -1969,7 +1969,7 @@ pub extern "C" fn rs_QueryInterfaceTagList(i: *mut Interface, name: *const u8, t
             // Down once ConfigureNetInterface DOWN took it down (Roadshow's
             // "Link status = Down").
             IFQ_STATE => long(if st.address.is_some() && st.up { SM_UP } else { SM_DOWN } as u32),
-            IFQ_NUM_READ_REQUESTS | IFQ_MAX_READ_REQUESTS | IFQ_NUM_READ_REQUESTS_PENDING => long(rsnet_core::link::READS),
+            IFQ_NUM_READ_REQUESTS | IFQ_MAX_READ_REQUESTS | IFQ_NUM_READ_REQUESTS_PENDING => long(st.link.reads_posted),
             IFQ_NUM_WRITE_REQUESTS | IFQ_MAX_WRITE_REQUESTS => long(1),
             IFQ_NUM_WRITE_REQUESTS_PENDING => long(0),
             IFQ_GET_BYTES_IN => quad(st.link.rx_bytes),

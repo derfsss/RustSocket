@@ -22,6 +22,17 @@
 //! buffer goes back there when smoltcp has read it), and smoltcp writes a
 //! frame to send straight into the write request's buffer
 //! ([`Link::send_with`]).
+//!
+//! A driver that has the unofficial SANA-II extensions (`amigaos4::sana2ext`:
+//! NSCMD_DEVICEQUERY lists S2X_QUERY, which answers with the magic) is
+//! used through batches instead: S2X_READBATCH requests, several per packet
+//! type and no CMD_READ for those types (the spec's dispatch rule), each
+//! carrying several frames with their own requests and buffers (allocated
+//! once, the buffers swapped as above), and one S2X_WRITEBATCH per run of
+//! queued frames. A frame the card checked carries its checksum result
+//! (S2XFRAME_CHECKSUM) to smoltcp, which then skips that check
+//! ([`Buf::trust`]); a bad one is dropped and counted. Any other answer
+//! from the driver means plain SANA-II, as before.
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -30,12 +41,17 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::ffi::c_void;
+use core::mem::size_of;
+use core::ptr::{addr_of, addr_of_mut, null_mut};
 
-use amigaos4::device::cmd::{CMD_READ, CMD_WRITE};
+use amigaos4::device::cmd::{CMD_READ, CMD_WRITE, NSCMD_DEVICEQUERY};
 use amigaos4::device::ioerr::IOERR_ABORTED;
 use amigaos4::port::AmigaMsgPort;
 use amigaos4::sana2::*;
+use amigaos4::sana2ext::{self as s2x, MinList, S2XBatch, S2XFrame, S2XFrameChecksum, S2XItem, S2XQuery};
 use amigaos4::sys::{self, TagItem};
+
+use crate::s2xlogic::{self, Caps, ReadNext, RxCsum};
 
 /// Room for a frame: the Ethernet header, a 1500-byte MTU and spare.
 pub const FRAME_MAX: usize = 1600;
@@ -46,6 +62,16 @@ const IPV4_READS: usize = 32;
 const ARP_READS: usize = 4;
 /// The reads a link keeps posted (every one is re-posted as it comes back).
 pub const READS: u32 = (IPV4_READS + ARP_READS) as u32;
+/// With read batches: the frames posted for IPv4 and for ARP, and the
+/// most frames one batch carries for each (the driver may allow fewer).
+/// Several batches per type, so the driver has room while the stack takes
+/// one that came back.
+const IPV4_BATCH_FRAMES: usize = 128;
+const IPV4_PER_BATCH: usize = 32;
+const ARP_BATCH_FRAMES: usize = 8;
+const ARP_PER_BATCH: usize = 4;
+/// The most frames one write batch carries.
+const TX_PER_BATCH: usize = 64;
 /// Frames received but not yet taken by smoltcp, at most.
 const RX_QUEUE_MAX: usize = 256;
 /// Frames waiting for flush(), at most: past it they are written at once.
@@ -56,11 +82,14 @@ const TX_QUEUE_MAX: usize = 256;
 pub struct Buf {
     len: u32,
     data: [u8; FRAME_MAX],
+    /// A received frame's s2xlogic TRUST_ bits: the checks the card made
+    /// that smoltcp may skip (0: smoltcp verifies everything).
+    pub(crate) trust: u8,
 }
 
 impl Buf {
     fn new() -> Box<Self> {
-        Box::new(Buf { len: 0, data: [0; FRAME_MAX] })
+        Box::new(Buf { len: 0, data: [0; FRAME_MAX], trust: 0 })
     }
 
     /// The frame it holds.
@@ -82,7 +111,9 @@ pub struct Pool(Rc<RefCell<Vec<Box<Buf>>>>);
 
 impl Pool {
     fn take(&self) -> Box<Buf> {
-        self.0.borrow_mut().pop().unwrap_or_else(Buf::new)
+        let mut b = self.0.borrow_mut().pop().unwrap_or_else(Buf::new);
+        b.trust = 0;
+        b
     }
 
     /// Hand a buffer back for the next read.
@@ -186,6 +217,215 @@ impl Req {
         self.r.set_wire_error(0);
         self.r.set_data(c);
     }
+
+    /// DeleteIORequest (the request is not in flight).
+    fn delete(&self) {
+        // SAFETY: our request, back from the device (or never sent).
+        unsafe { sys::exec_delete_iorequest(self.r.as_ptr()) };
+    }
+}
+
+/// One frame of a batch: its S2XFrame, its checksum item and its own
+/// request (an opened copy of the base request) with its buffer. Boxed:
+/// the lists point into it.
+struct Slot {
+    frame: S2XFrame,
+    csum: S2XFrameChecksum,
+    req: Req,
+}
+
+/// A read or write batch: its own request, the S2XBatch (boxed: the list
+/// points into it) and its frames, all allocated once and reused.
+struct Batch {
+    req: Req,
+    batch: Box<S2XBatch>,
+    slots: Vec<Box<Slot>>,
+    /// The packet type a read batch waits for (0 for the write batch).
+    ptype: u32,
+    /// Link each frame's S2XFRAME_CHECKSUM item.
+    csum_item: bool,
+    /// Sent and not yet back.
+    in_flight: bool,
+    /// The driver refused the command: no longer used.
+    dead: bool,
+}
+
+impl Batch {
+    fn new(port: &AmigaMsgPort, base: &Req, frames: usize, ptype: u32, csum_item: bool) -> Result<Self, String> {
+        let req = Link::copy_of(port, base)?;
+        let batch = Box::new(S2XBatch {
+            s2xb_Size: size_of::<S2XBatch>() as u32,
+            s2xb_Count: 0,
+            s2xb_Frames: MinList { mlh_Head: null_mut(), mlh_Tail: null_mut(), mlh_TailPred: null_mut() },
+            s2xb_Done: 0,
+            s2xb_Queue: 0,
+        });
+        let mut b = Batch { req, batch, slots: Vec::with_capacity(frames), ptype, csum_item, in_flight: false, dead: false };
+        for _ in 0..frames {
+            let r = match Link::copy_of(port, base) {
+                Ok(r) => r,
+                Err(e) => {
+                    b.delete();
+                    return Err(e);
+                }
+            };
+            b.slots.push(Box::new(Slot {
+                frame: S2XFrame {
+                    s2xf_Node: MinNode { mln_Succ: null_mut(), mln_Pred: null_mut() },
+                    s2xf_Req: null_mut(),
+                    s2xf_Items: MinList { mlh_Head: null_mut(), mlh_Tail: null_mut(), mlh_TailPred: null_mut() },
+                    s2xf_Size: size_of::<S2XFrame>() as u32,
+                    s2xf_Reserved: 0,
+                },
+                csum: S2XFrameChecksum { s2xfc_Header: S2XItem::new(s2x::S2XFRAME_CHECKSUM, size_of::<S2XFrameChecksum>()), s2xfc_Flags: 0, s2xfc_Start: 0, s2xfc_Offset: 0 },
+                req: r,
+            }));
+        }
+        Ok(b)
+    }
+
+    /// Link the first `count` frames (each with its items) into the batch
+    /// and ready the batch's request for `cmd`. The frames' own requests
+    /// are set by the caller. The lists are built again every time: the
+    /// driver owned them while the batch was out.
+    fn arm(&mut self, count: usize, cmd: u16) {
+        let list = addr_of_mut!(self.batch.s2xb_Frames);
+        // SAFETY: the boxed batch and slots do not move while linked; the
+        // batch is not in flight (ours to change).
+        unsafe {
+            MinList::init(list);
+            for s in self.slots[..count].iter_mut() {
+                let s: &mut Slot = s;
+                s.frame.s2xf_Req = s.req.r.raw();
+                s.frame.s2xf_Size = size_of::<S2XFrame>() as u32;
+                let items = addr_of_mut!(s.frame.s2xf_Items);
+                MinList::init(items);
+                if self.csum_item {
+                    s.csum.s2xfc_Flags = 0;
+                    s.csum.s2xfc_Start = 0;
+                    s.csum.s2xfc_Offset = 0;
+                    MinList::add_tail(items, addr_of_mut!(s.csum.s2xfc_Header.s2xi_Node));
+                }
+                MinList::add_tail(list, addr_of_mut!(s.frame.s2xf_Node));
+            }
+        }
+        self.batch.s2xb_Size = size_of::<S2XBatch>() as u32;
+        self.batch.s2xb_Count = count as u32;
+        self.batch.s2xb_Done = 0;
+        self.batch.s2xb_Queue = 0;
+        self.req.set(cmd, SANA2IOF_RAW);
+        self.req.r.set_data(null_mut());
+        self.req.r.set_data_length(0);
+        self.req.r.set_packet_type(self.ptype);
+        self.req.r.set_stat_data(&mut *self.batch as *mut S2XBatch as *mut c_void);
+    }
+
+    /// The batch's io_Error and s2xb_Done once it is back.
+    fn result(&self) -> (i8, u32) {
+        (self.req.r.io().error(), self.batch.s2xb_Done)
+    }
+
+    /// Send it (BeginIO: the RAW flag stays).
+    fn begin(&mut self) {
+        self.in_flight = true;
+        // SAFETY: our opened request copy, armed, not in flight; the batch
+        // and every frame it lists stay put until it is back.
+        unsafe { sys::exec_begin_io(self.req.r.as_ptr()) };
+    }
+
+    /// Delete every request (none in flight).
+    fn delete(&self) {
+        for s in &self.slots {
+            s.req.delete();
+        }
+        self.req.delete();
+    }
+}
+
+/// The driver's NSCMD_DEVICEQUERY answer lists S2X_QUERY, which answers
+/// with the magic: its capabilities (sanitised); else all zero.
+fn discover(base: &mut Req) -> Caps {
+    // NSCMD_DEVICEQUERY uses io_Data / io_Length (an IOStdReq's fields,
+    // over ios2_PacketType and ios2_SrcAddr here, set again before use).
+    let mut res = Box::new([0u32; 4]);
+    base.set(NSCMD_DEVICEQUERY, 0);
+    let io = base.r.io();
+    io.set_length(16);
+    io.set_data(res.as_mut_ptr() as *mut u8);
+    io.set_actual(0);
+    // SAFETY: our opened request, not in use; `res` is 16 bytes and lives
+    // across the call.
+    unsafe { sys::exec_do_io(base.r.as_ptr()) };
+    if io.error() != 0 || res[1] < 16 {
+        return Caps::default();
+    }
+    // SupportedCommands: a pointer (offset 12), a 0-terminated list.
+    // SAFETY: the 16-byte answer holds it at offset 12.
+    let cmds = unsafe { core::ptr::read_unaligned((res.as_ptr() as *const u8).add(12) as *const *const u16) };
+    if cmds.is_null() {
+        return Caps::default();
+    }
+    // SAFETY: the driver's static list, 0-terminated (looked at for 512
+    // entries at most).
+    let listed = s2xlogic::supports((0..512).map(|i| unsafe { cmds.add(i).read_unaligned() }), s2x::S2X_QUERY);
+    if !listed {
+        return Caps::default();
+    }
+    let mut q = Box::new(S2XQuery { s2xq_Size: size_of::<S2XQuery>() as u32, s2xq_Magic: 0, s2xq_Version: 0, s2xq_Revision: 0, s2xq_Features: 0, s2xq_Capabilities: core::ptr::null() });
+    base.set(s2x::S2X_QUERY, 0);
+    base.r.set_stat_data(&mut *q as *mut S2XQuery as *mut c_void);
+    // SAFETY: our opened request; `q` is a sized S2XQuery alive across it.
+    unsafe { sys::exec_do_io(base.r.as_ptr()) };
+    base.r.set_stat_data(null_mut());
+    if base.r.io().error() != 0 || q.s2xq_Magic != s2x::S2X_MAGIC {
+        return Caps::default();
+    }
+    let mut c = Caps { present: true, version: q.s2xq_Version, revision: q.s2xq_Revision, features: q.s2xq_Features, ..Caps::default() };
+    let list = q.s2xq_Capabilities;
+    if !list.is_null() {
+        // SAFETY: the driver's read-only capability list, valid until
+        // CloseDevice; every node starts an item (the spec); `find` only
+        // returns items at least as large as the structure read.
+        unsafe {
+            if let Some(b) = s2x::find::<s2x::S2XCapBatch>(list, s2x::S2XCAP_BATCH) {
+                c.batch_frames = addr_of!((*b).s2xcb_MaxFrames).read_unaligned();
+            }
+            if let Some(x) = s2x::find::<s2x::S2XCapChecksum>(list, s2x::S2XCAP_RXCHECKSUM) {
+                c.rx_csum = addr_of!((*x).s2xcc_Protocols).read_unaligned();
+            }
+            if let Some(x) = s2x::find::<s2x::S2XCapChecksum>(list, s2x::S2XCAP_TXCHECKSUM) {
+                c.tx_csum = addr_of!((*x).s2xcc_Protocols).read_unaligned();
+            }
+            if let Some(x) = s2x::find::<s2x::S2XCapSegment>(list, s2x::S2XCAP_SEGMENT) {
+                c.seg_protocols = addr_of!((*x).s2xcs_Protocols).read_unaligned();
+                c.seg_max_size = addr_of!((*x).s2xcs_MaxSize).read_unaligned();
+                c.seg_max_segments = addr_of!((*x).s2xcs_MaxSegments).read_unaligned();
+                c.seg_min_seg = addr_of!((*x).s2xcs_MinSegSize).read_unaligned();
+            }
+            if let Some(x) = s2x::find::<s2x::S2XCapMTU>(list, s2x::S2XCAP_MTU) {
+                c.mtu_min = addr_of!((*x).s2xcm_MinMTU).read_unaligned();
+                c.mtu_max = addr_of!((*x).s2xcm_MaxMTU).read_unaligned();
+            }
+            if let Some(x) = s2x::find::<s2x::S2XCapModeration>(list, s2x::S2XCAP_MODERATION) {
+                c.moderation = true;
+                c.mod_max_us = addr_of!((*x).s2xco_MaxMicros).read_unaligned();
+                c.mod_flags = addr_of!((*x).s2xco_Flags).read_unaligned();
+            }
+            if let Some(x) = s2x::find::<s2x::S2XCapFlowControl>(list, s2x::S2XCAP_FLOWCONTROL) {
+                c.flow_control = true;
+                c.fc_modes = addr_of!((*x).s2xcf_Modes).read_unaligned();
+            }
+            if let Some(x) = s2x::find::<s2x::S2XCapRSS>(list, s2x::S2XCAP_RSS) {
+                c.rss_hash = addr_of!((*x).s2xcr_HashTypes).read_unaligned();
+                c.rss_queues = addr_of!((*x).s2xcr_MaxQueues).read_unaligned();
+                c.rss_tx_queues = addr_of!((*x).s2xcr_MaxTxQueues).read_unaligned();
+                c.rss_key = addr_of!((*x).s2xcr_KeySize).read_unaligned();
+                c.rss_table = addr_of!((*x).s2xcr_TableSize).read_unaligned();
+            }
+        }
+    }
+    c.sanitize();
+    c
 }
 
 /// What has gone through the link.
@@ -202,6 +442,20 @@ pub struct LinkStats {
     /// header included).
     pub rx_bytes: u64,
     pub tx_bytes: u64,
+    /// Frames the link keeps posted for reading (plain reads, or the
+    /// frames of its read batches).
+    pub reads_posted: u32,
+    /// Read batches that came back and the frames they carried (frames
+    /// per batch: the one divided by the other); the same for writes.
+    pub rx_batches: u32,
+    pub rx_batch_frames: u32,
+    pub tx_batches: u32,
+    pub tx_batch_frames: u32,
+    /// Received frames whose checksums the card checked and smoltcp
+    /// skipped (at least one of IPv4 header, TCP/UDP), and frames the card
+    /// found bad (dropped; also counted in rx_errors).
+    pub rx_csum_ok: u32,
+    pub rx_csum_bad: u32,
 }
 
 /// An opened SANA-II unit with its reads pending.
@@ -211,6 +465,13 @@ pub struct Link {
     /// management) do the work. Closed last.
     base: Req,
     reads: Vec<Req>,
+    /// Read batches (extensions only): several per packet type.
+    rx_batches: Vec<Batch>,
+    /// The write batch (extensions only), and whether it is still used.
+    tx_batch: Option<Batch>,
+    tx_batch_on: bool,
+    /// What the driver offers (all zero: plain SANA-II).
+    pub caps: Caps,
     write: Req,
     /// The buffer-management tags, read by OpenDevice.
     _tags: Box<[TagItem; 3]>,
@@ -277,6 +538,10 @@ impl Link {
             port,
             base,
             reads: Vec::new(),
+            rx_batches: Vec::new(),
+            tx_batch: None,
+            tx_batch_on: false,
+            caps: Caps::default(),
             write,
             _tags: tags,
             mac: mac.unwrap_or([0; 6]),
@@ -296,17 +561,134 @@ impl Link {
         };
         // From here, dropping `link` closes the device.
         link.query()?;
-        for (ptype, n) in [(0x0800u32, IPV4_READS), (0x0806, ARP_READS)] {
-            for _ in 0..n {
-                let mut r = Self::copy_of(&link.port, &link.base)?;
-                r.ptype = ptype;
-                link.reads.push(r);
+        link.caps = discover(&mut link.base);
+        if link.caps.batches() {
+            link.report_caps(device, unit);
+            let max = link.caps.batch_frames;
+            let csum = link.caps.rx_csum != 0;
+            for (ptype, want, prefer) in [(0x0800u32, IPV4_BATCH_FRAMES, IPV4_PER_BATCH), (0x0806, ARP_BATCH_FRAMES, ARP_PER_BATCH)] {
+                let (n, per) = s2xlogic::plan_reads(want, max, prefer);
+                for _ in 0..n {
+                    let b = Batch::new(&link.port, &link.base, per, ptype, csum)?;
+                    link.rx_batches.push(b);
+                }
+            }
+            let per = TX_PER_BATCH.min(max as usize).max(1);
+            link.tx_batch = Some(Batch::new(&link.port, &link.base, per, 0, false)?);
+            link.tx_batch_on = true;
+            for k in 0..link.rx_batches.len() {
+                link.post_batch(k);
+            }
+        } else {
+            for (ptype, n) in [(0x0800u32, IPV4_READS), (0x0806, ARP_READS)] {
+                link.add_reads(ptype, n)?;
             }
         }
-        for k in 0..link.reads.len() {
-            link.post(k);
-        }
+        link.stats.reads_posted = link.reads.len() as u32 + link.rx_batches.iter().map(|b| b.slots.len() as u32).sum::<u32>();
         Ok(link)
+    }
+
+    /// `n` more plain reads for `ptype`, posted.
+    fn add_reads(&mut self, ptype: u32, n: usize) -> Result<(), String> {
+        for _ in 0..n {
+            let mut r = Self::copy_of(&self.port, &self.base)?;
+            r.ptype = ptype;
+            self.reads.push(r);
+            let k = self.reads.len() - 1;
+            self.post(k);
+        }
+        Ok(())
+    }
+
+    /// One line on the debug log: what the driver offers.
+    fn report_caps(&self, device: &str, unit: u32) {
+        let c = &self.caps;
+        amigaos4::serial_println!(
+            "rsnet: {} unit {}: SANA-II extensions version {} revision {}: batches of {} frames, rx checksums {:#x}, tx checksums {:#x}, segmentation {:#x} (up to {} bytes), MTU {}-{}, RSS {} queues",
+            device, unit, c.version, c.revision, c.batch_frames, c.rx_csum, c.tx_csum, c.seg_protocols, c.seg_max_size, c.mtu_min, c.mtu_max, c.rss_queues
+        );
+    }
+
+    /// Post read batch `k` again: every frame with its own buffer, the
+    /// checksum items cleared.
+    fn post_batch(&mut self, k: usize) {
+        let b = &mut self.rx_batches[k];
+        let ptype = b.ptype;
+        for s in b.slots.iter_mut() {
+            s.req.set(CMD_READ, SANA2IOF_RAW);
+            s.req.r.set_packet_type(ptype);
+            s.req.r.set_data_length(FRAME_MAX as u32);
+        }
+        let n = b.slots.len();
+        b.arm(n, s2x::S2X_READBATCH);
+        b.begin();
+    }
+
+    /// Read batch `k` came back: its frames into the queue (checksum
+    /// results applied), then posted again.
+    fn take_batch(&mut self, k: usize) {
+        let caps = self.caps;
+        let b = &mut self.rx_batches[k];
+        b.in_flight = false;
+        let (err, done) = b.result();
+        let (filled, next) = s2xlogic::read_outcome(b.slots.len(), done, err);
+        for s in b.slots[..filled].iter_mut() {
+            if s.req.r.io().error() != 0 {
+                self.stats.rx_errors += 1;
+                continue;
+            }
+            let n = (s.req.buf.len as usize).min(FRAME_MAX);
+            let flags = if b.csum_item { s.csum.s2xfc_Flags } else { 0 };
+            // The frame's buffer goes to the queue, a spare one takes its
+            // place (set as the cookie when the batch is posted again).
+            let mut full = core::mem::replace(&mut s.req.buf, self.pool.take());
+            full.len = n as u32;
+            match s2xlogic::rx_csum(flags, caps.rx_csum, full.frame()) {
+                RxCsum::Bad => {
+                    self.stats.rx_csum_bad += 1;
+                    self.stats.rx_errors += 1;
+                    self.pool.give(full);
+                    continue;
+                }
+                RxCsum::Trust(t) => {
+                    full.trust = t;
+                    if t != 0 {
+                        self.stats.rx_csum_ok += 1;
+                    }
+                }
+            }
+            self.rx.push_back(full);
+            self.stats.rx_frames += 1;
+            self.stats.rx_bytes += n as u64;
+        }
+        self.stats.rx_batches += 1;
+        self.stats.rx_batch_frames += filled as u32;
+        #[cfg(feature = "perf")]
+        crate::perf::batch_taken(filled as u32);
+        match next {
+            ReadNext::Repost { error } => {
+                if error {
+                    self.stats.rx_errors += 1;
+                }
+                if !self.closed {
+                    self.post_batch(k);
+                }
+            }
+            ReadNext::Stop => {}
+            ReadNext::Fallback => {
+                // The driver said S2X_QUERY yet refuses the batch: plain
+                // reads for this packet type in its place.
+                let b = &mut self.rx_batches[k];
+                b.dead = true;
+                let (ptype, n) = (b.ptype, b.slots.len().min(IPV4_READS));
+                if self.stats.rx_errors < 8 {
+                    amigaos4::serial_println!("rsnet: S2X_READBATCH refused (io_Error {}): plain reads for type {:#06x}", err, ptype);
+                }
+                if !self.closed && self.add_reads(ptype, n).is_ok() {
+                    self.stats.reads_posted = self.reads.len() as u32 + self.rx_batches.iter().filter(|b| !b.dead).map(|b| b.slots.len() as u32).sum::<u32>();
+                }
+            }
+        }
     }
 
     /// A new request on `port` copied from `base` (device, unit, buffer
@@ -411,6 +793,15 @@ impl Link {
             }
             let Some(m) = self.port.get_raw() else { break };
             let Some(k) = self.reads.iter().position(|r| r.r.as_ptr() as *mut sys::Message == m) else {
+                if let Some(k) = self.rx_batches.iter().position(|b| b.req.r.as_ptr() as *mut sys::Message == m) {
+                    #[cfg(feature = "perf")]
+                    let before = self.stats.rx_frames;
+                    self.take_batch(k);
+                    #[cfg(feature = "perf")]
+                    {
+                        taken += self.stats.rx_frames - before;
+                    }
+                }
                 continue;
             };
             let err = self.reads[k].r.io().error();
@@ -422,7 +813,8 @@ impl Link {
                 let n = (self.reads[k].buf.len as usize).min(FRAME_MAX);
                 if self.rx.len() < RX_QUEUE_MAX {
                     // The read takes a spare buffer; its own goes to the queue.
-                    let full = core::mem::replace(&mut self.reads[k].buf, self.pool.take());
+                    let mut full = core::mem::replace(&mut self.reads[k].buf, self.pool.take());
+                    full.trust = 0;
                     self.rx.push_back(full);
                     self.stats.rx_frames += 1;
                     self.stats.rx_bytes += n as u64;
@@ -529,11 +921,77 @@ impl Link {
     /// Write the frames waiting in order, each waited for. A refused write
     /// is dropped and counted (TCP sends it again).
     pub fn flush(&mut self) {
+        if self.tx_batch_on {
+            self.flush_batches();
+        }
         while let Some(b) = self.tx.pop_front() {
             let len = b.len as usize;
             let old = core::mem::replace(&mut self.write.buf, b);
             self.pool.give(old);
             self.write_one(len);
+        }
+    }
+
+    /// Write the frames waiting as S2X_WRITEBATCHes, each waited for. The
+    /// frame a batch refuses is dropped and counted as a refused write is;
+    /// those after it (untouched, the spec says) go in the next batch. A
+    /// batch that takes nothing and refuses nothing leaves the frames to
+    /// plain writes (for good when the driver does not know the command).
+    fn flush_batches(&mut self) {
+        while !self.tx.is_empty() {
+            let Some(tb) = self.tx_batch.as_mut() else { return };
+            let n = self.tx.len().min(tb.slots.len());
+            for s in tb.slots[..n].iter_mut() {
+                let Some(b) = self.tx.pop_front() else { break };
+                let len = b.len as usize;
+                let old = core::mem::replace(&mut s.req.buf, b);
+                self.pool.give(old);
+                let frame = &s.req.buf.data[..len];
+                let ptype = u16::from_be_bytes([frame[12], frame[13]]) as u32;
+                let mut dst = [0u8; 6];
+                dst.copy_from_slice(&frame[0..6]);
+                s.req.set(CMD_WRITE, SANA2IOF_RAW);
+                s.req.r.set_data_length(len as u32);
+                s.req.r.set_packet_type(ptype);
+                s.req.r.set_dst_mac(&dst);
+            }
+            tb.arm(n, s2x::S2X_WRITEBATCH);
+            let perf_t = crate::perf::now();
+            tb.begin();
+            // SAFETY: the batch just sent; WaitIO takes its reply off our
+            // port (reads' replies stay queued for poll()).
+            unsafe { sys::exec_wait_io(tb.req.r.as_ptr()) };
+            crate::perf::add(crate::perf::TX_WAIT, perf_t);
+            tb.in_flight = false;
+            let (err, done) = tb.result();
+            let frame_err = if (done as usize) < n { tb.slots[done as usize].req.r.io().error() } else { 0 };
+            let o = s2xlogic::write_outcome(n, done, err, frame_err);
+            for s in tb.slots[..o.sent].iter() {
+                self.stats.tx_frames += 1;
+                self.stats.tx_bytes += s.req.buf.len as u64;
+            }
+            self.stats.tx_batches += 1;
+            self.stats.tx_batch_frames += o.sent as u32;
+            if o.refused {
+                if self.stats.tx_errors < 8 {
+                    let s = &tb.slots[o.sent];
+                    amigaos4::serial_println!("rsnet: write refused in a batch: io_Error {} wire error {} ({} bytes)", frame_err, s.req.r.wire_error(), s.req.buf.len);
+                }
+                self.stats.tx_errors += 1;
+            }
+            // The untouched ones back to the front, in order.
+            for s in tb.slots[o.resend_from..n].iter_mut().rev() {
+                let b = core::mem::replace(&mut s.req.buf, self.pool.take());
+                self.tx.push_front(b);
+            }
+            if o.plain {
+                if o.give_up {
+                    amigaos4::serial_println!("rsnet: S2X_WRITEBATCH refused (io_Error {}): plain writes", err);
+                    self.tx_batch_on = false;
+                }
+                // flush() writes what is left one by one.
+                return;
+            }
         }
     }
 
@@ -597,6 +1055,19 @@ impl Drop for Link {
                 sys::exec_abort_io(r.r.as_ptr());
                 sys::exec_wait_io(r.r.as_ptr());
             }
+        }
+        // A read batch is aborted through its own request only; what it
+        // filled is let go.
+        for b in self.rx_batches.iter_mut().filter(|b| b.in_flight) {
+            // SAFETY: our batch request, in flight or replied (as above).
+            unsafe {
+                sys::exec_abort_io(b.req.r.as_ptr());
+                sys::exec_wait_io(b.req.r.as_ptr());
+            }
+            b.in_flight = false;
+        }
+        for b in self.rx_batches.iter().chain(self.tx_batch.iter()) {
+            b.delete();
         }
         // SAFETY: every copy is back; the base request is the opened one,
         // closed once; then all are deleted.

@@ -15,6 +15,7 @@
 extern crate alloc;
 
 pub mod link;
+pub mod s2xlogic;
 pub mod phy;
 pub mod stack;
 pub mod sock;

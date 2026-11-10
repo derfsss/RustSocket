@@ -59,6 +59,34 @@ mod on {
         }
     }
 
+    static RB_BATCHES: AtomicU32 = AtomicU32::new(0);
+    static RB_FRAMES: AtomicU32 = AtomicU32::new(0);
+    static RB_MAX: AtomicU32 = AtomicU32::new(0);
+    static RB_EMPTY: AtomicU32 = AtomicU32::new(0);
+
+    /// One read batch came back with `frames` filled.
+    pub fn batch_taken(frames: u32) {
+        RB_BATCHES.fetch_add(1, Ordering::Relaxed);
+        RB_FRAMES.fetch_add(frames, Ordering::Relaxed);
+        RB_MAX.fetch_max(frames, Ordering::Relaxed);
+        if frames == 0 {
+            RB_EMPTY.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The SANA-II extension counters of one link (totals since it was
+    /// added), after each report.
+    pub fn link_s2x(slot: u8, s: &crate::link::LinkStats) {
+        if s.rx_batches == 0 && s.tx_batches == 0 {
+            return;
+        }
+        amigaos4::serial_println!(
+            "rsnet perf:   if {}: rx batches {} frames {} ({:.1}/batch), tx batches {} frames {} ({:.1}/batch), rx csum skipped {} bad {}",
+            slot, s.rx_batches, s.rx_batch_frames, s.rx_batch_frames as f64 / s.rx_batches.max(1) as f64,
+            s.tx_batches, s.tx_batch_frames, s.tx_batch_frames as f64 / s.tx_batches.max(1) as f64, s.rx_csum_ok, s.rx_csum_bad
+        );
+    }
+
     #[inline]
     pub fn add(i: usize, since: u64) {
         let d = now().wrapping_sub(since) as u32;
@@ -112,6 +140,15 @@ mod on {
             LP_TAKEN_MAX.swap(0, Ordering::Relaxed), LP_Q0_MAX.swap(0, Ordering::Relaxed),
             LP_DROP_POLLS.swap(0, Ordering::Relaxed), LP_DROPPED.swap(0, Ordering::Relaxed)
         );
+        // Read batches (SANA-II extensions): frames each carried.
+        let batches = RB_BATCHES.swap(0, Ordering::Relaxed);
+        if batches > 0 {
+            let frames = RB_FRAMES.swap(0, Ordering::Relaxed);
+            amigaos4::serial_println!(
+                "rsnet perf:   read batches {}, frames {} ({:.1}/batch, most {}, empty {})",
+                batches, frames, frames as f64 / batches as f64, RB_MAX.swap(0, Ordering::Relaxed), RB_EMPTY.swap(0, Ordering::Relaxed)
+            );
+        }
         // smoltcp's own phases (its rsnet-perf feature, same time base).
         for i in 0..smoltcp::perfhook::N {
             let (ticks, calls) = smoltcp::perfhook::take(i);
@@ -152,6 +189,8 @@ mod off {
     pub fn report(_frames_in: u64, _frames_out: u64) -> bool {
         false
     }
+    #[inline(always)]
+    pub fn link_s2x(_slot: u8, _s: &crate::link::LinkStats) {}
 }
 
 #[cfg(not(feature = "perf"))]

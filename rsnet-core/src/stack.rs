@@ -140,6 +140,9 @@ pub struct Status {
     pub lease: Option<([u8; 4], u64)>,
     /// IFA_DownGoesOffline: S2_OFFLINE when taken down, S2_ONLINE when up.
     pub down_offline: bool,
+    /// What the driver offers through the SANA-II extensions (all zero:
+    /// plain SANA-II).
+    pub s2x: crate::s2xlogic::Caps,
 }
 
 /// The interface's addresses: the primary (if any), then its aliases (with
@@ -478,6 +481,7 @@ fn add_iface(sides: &mut Vec<Side>, nets: &mut Vec<Net>, socks: &mut crate::sock
         hw_type: link.hw_type,
         addr_bits: link.addr_bits,
         down_offline,
+        s2x: link.caps,
         ..Status::default()
     };
     let k = match again {
@@ -1253,6 +1257,9 @@ fn run(starter: Sender<Ctl>) {
             if crate::perf::report(fi.wrapping_sub(perf_in), fo.wrapping_sub(perf_out)) {
                 perf_in = fi;
                 perf_out = fo;
+                for l in sides.iter().filter_map(|s| s.link.as_ref()) {
+                    crate::perf::link_s2x(l.slot, &l.stats);
+                }
             }
         }
         drop(guard);
